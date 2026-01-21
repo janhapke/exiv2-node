@@ -1,7 +1,4 @@
-#include <v8.h>
-#include <node.h>
-#include <node_buffer.h>
-#include <nan.h>
+#include <napi.h>
 #ifdef _MSC_VER
 # include <direct.h>
 # include <process.h>
@@ -11,6 +8,8 @@
 #endif
 #include <string>
 #include <map>
+#include <vector>
+#include <cmath>
 #include <exception>
 #include <exiv2/image.hpp>
 #include <exiv2/exif.hpp>
@@ -24,69 +23,54 @@
   #pragma message ("Using Exiv2::Image::AutoPtr")
 #endif
 
-using namespace node;
-using namespace v8;
-
-// Create a map of strings for passing them back and forth between the V8 and
+// Create a map of strings for passing them back and forth between the main and
 // worker threads.
 typedef std::map<std::string, std::string> tag_map_t;
 
-class Exiv2Worker : public Nan::AsyncWorker {
+// - - - GetTagsWorker - - -
+
+class GetTagsWorker : public Napi::AsyncWorker {
  public:
-  Exiv2Worker(Nan::Callback *callback, const std::string fileName)
-    : Nan::AsyncWorker(callback), isBuf(false), fileName(fileName) {}
-  Exiv2Worker(Nan::Callback *callback, const char* buf, const long len)
-    : Nan::AsyncWorker(callback), isBuf(true), buf(reinterpret_cast<const Exiv2::byte*>(buf)), bufLen(len) {}
-  ~Exiv2Worker() {}
+  GetTagsWorker(Napi::Function& callback, const std::string fileName)
+    : Napi::AsyncWorker(callback), isBuf(false), fileName(fileName) {}
 
- protected:
-  const bool isBuf;
-  const Exiv2::byte* buf = nullptr;
-  const long bufLen = -1;
-  const std::string fileName = "";
-  std::string exifException;
-
-  #if USE_EXIV2_UNIQUE_PTR
-    Exiv2::Image::UniquePtr image() {
-  #else
-    Exiv2::Image::AutoPtr image() {
-  #endif
-    return this->isBuf
-      ? Exiv2::ImageFactory::open(this->buf, this->bufLen)
-      : Exiv2::ImageFactory::open(this->fileName);
+  GetTagsWorker(Napi::Function& callback, const char* buf, const size_t len)
+    : Napi::AsyncWorker(callback), isBuf(true), bufLen(len) {
+    // Copy the buffer data since it may be garbage collected before Execute runs
+    bufCopy = new Exiv2::byte[len];
+    memcpy(bufCopy, buf, len);
+    this->buf = bufCopy;
   }
-};
 
-// - - -
+  ~GetTagsWorker() {
+    if (bufCopy) {
+      delete[] bufCopy;
+    }
+  }
 
-class GetTagsWorker : public Exiv2Worker {
- public:
-  GetTagsWorker(Nan::Callback *callback, const std::string fileName)
-    : Exiv2Worker(callback, fileName) {}
-  GetTagsWorker(Nan::Callback *callback, const char* buf, const long len)
-    : Exiv2Worker(callback, buf, len) {}
-  ~GetTagsWorker() {}
-
-  // Should become protected...
-  tag_map_t tags;
-
-  // Executed inside the worker-thread. Not safe to access V8, or V8 data
-  // structures here.
-  void Execute () {
+  // Executed inside the worker-thread. Not safe to access Napi values here.
+  void Execute() override {
     try {
       #if USE_EXIV2_UNIQUE_PTR
-        Exiv2::Image::UniquePtr image = this->image();
+        Exiv2::Image::UniquePtr image = this->isBuf
+          ? Exiv2::ImageFactory::open(this->buf, this->bufLen)
+          : Exiv2::ImageFactory::open(this->fileName);
       #else
-        Exiv2::Image::AutoPtr image = this->image();
+        Exiv2::Image::AutoPtr image = this->isBuf
+          ? Exiv2::ImageFactory::open(this->buf, this->bufLen)
+          : Exiv2::ImageFactory::open(this->fileName);
       #endif
-      assert(image.get() != 0);
+      if (!image.get()) {
+        exifException = "Failed to open image";
+        return;
+      }
       image->readMetadata();
 
       Exiv2::ExifData &exifData = image->exifData();
       if (exifData.empty() == false) {
         Exiv2::ExifData::const_iterator end = exifData.end();
         for (Exiv2::ExifData::const_iterator i = exifData.begin(); i != end; ++i) {
-          tags.insert(std::pair<std::string, std::string> (i->key(), i->value().toString()));
+          tags.insert(std::pair<std::string, std::string>(i->key(), i->value().toString()));
         }
       }
 
@@ -94,7 +78,7 @@ class GetTagsWorker : public Exiv2Worker {
       if (iptcData.empty() == false) {
         Exiv2::IptcData::const_iterator end = iptcData.end();
         for (Exiv2::IptcData::const_iterator i = iptcData.begin(); i != end; ++i) {
-          tags.insert(std::pair<std::string, std::string> (i->key(), i->value().toString()));
+          tags.insert(std::pair<std::string, std::string>(i->key(), i->value().toString()));
         }
       }
 
@@ -102,84 +86,102 @@ class GetTagsWorker : public Exiv2Worker {
       if (xmpData.empty() == false) {
         Exiv2::XmpData::const_iterator end = xmpData.end();
         for (Exiv2::XmpData::const_iterator i = xmpData.begin(); i != end; ++i) {
-          tags.insert(std::pair<std::string, std::string> (i->key(), i->value().toString()));
+          tags.insert(std::pair<std::string, std::string>(i->key(), i->value().toString()));
         }
       }
     } catch (std::exception& e) {
-      exifException.append(e.what());
+      exifException = e.what();
     }
   }
 
-  // This function will be run inside the main event loop so it is safe to use
-  // V8 again.
-  void HandleOKCallback () {
-    Nan::HandleScope scope;
+  void OnOK() override {
+    Napi::HandleScope scope(Env());
 
-    Local<Value> argv[2] = { Nan::Null(), Nan::Null() };
-
-    if (!exifException.empty()){
-      argv[0] = Nan::New<String>(exifException.c_str()).ToLocalChecked();
+    if (!exifException.empty()) {
+      Callback().Call({Napi::String::New(Env(), exifException), Env().Null()});
     } else if (!tags.empty()) {
-      Local<Object> hash = Nan::New<Object>();
-      // Copy the tags out.
+      Napi::Object hash = Napi::Object::New(Env());
       for (tag_map_t::iterator i = tags.begin(); i != tags.end(); ++i) {
-        Nan::Set(
-          hash,
-          Nan::New<String>(i->first.c_str()).ToLocalChecked(),
-          Nan::New<String>(i->second.c_str()).ToLocalChecked()
-        );
+        hash.Set(i->first, i->second);
       }
-      argv[1] = hash;
+      Callback().Call({Env().Null(), hash});
+    } else {
+      Callback().Call({Env().Null(), Env().Null()});
     }
+  }
 
-    // Pass the argv array object to our callback function.
-    Nan::Call(callback->GetFunction(), Nan::GetCurrentContext()->Global(), 2, argv);
-  };
+ protected:
+  const bool isBuf;
+  const Exiv2::byte* buf = nullptr;
+  Exiv2::byte* bufCopy = nullptr;
+  const size_t bufLen = 0;
+  const std::string fileName = "";
+  std::string exifException;
+  tag_map_t tags;
 };
 
-NAN_METHOD(GetImageTags) {
-  Nan::HandleScope scope;
+Napi::Value GetImageTags(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
 
-  /* Usage arguments */
-  if (info.Length() <= 1 || !info[1]->IsFunction())
-    return Nan::ThrowTypeError("Usage: <filename/buffer> <callback function>");
-
-  Nan::Callback *callback = new Nan::Callback(info[1].As<Function>());
-  if (info[0]->IsString()) {
-    std::string filename = std::string(*Nan::Utf8String(info[0]));
-    Nan::AsyncQueueWorker(new GetTagsWorker(callback, filename));
-  } else {
-    Local<Object> buf;
-    info[0]->ToObject(Nan::GetCurrentContext()).ToLocal(&buf);
-
-    Nan::AsyncQueueWorker(new GetTagsWorker(callback, Buffer::Data(buf), Buffer::Length(buf)));
+  if (info.Length() <= 1 || !info[1].IsFunction()) {
+    Napi::TypeError::New(env, "Usage: <filename/buffer> <callback function>").ThrowAsJavaScriptException();
+    return env.Undefined();
   }
-  return;
+
+  Napi::Function callback = info[1].As<Napi::Function>();
+
+  if (info[0].IsString()) {
+    std::string filename = info[0].As<Napi::String>().Utf8Value();
+    GetTagsWorker* worker = new GetTagsWorker(callback, filename);
+    worker->Queue();
+  } else if (info[0].IsBuffer()) {
+    Napi::Buffer<char> buf = info[0].As<Napi::Buffer<char>>();
+    GetTagsWorker* worker = new GetTagsWorker(callback, buf.Data(), buf.Length());
+    worker->Queue();
+  } else {
+    Napi::TypeError::New(env, "First argument must be a string or buffer").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  return env.Undefined();
 }
 
-// - - -
+// - - - SetTagsWorker - - -
 
-class SetTagsWorker : public Exiv2Worker {
+class SetTagsWorker : public Napi::AsyncWorker {
  public:
-  SetTagsWorker(Nan::Callback *callback, const std::string fileName)
-    : Exiv2Worker(callback, fileName) {}
-  SetTagsWorker(Nan::Callback *callback, const char* buf, const long len)
-    : Exiv2Worker(callback, buf, len) {}
-  ~SetTagsWorker() {}
+  SetTagsWorker(Napi::Function& callback, const std::string fileName, tag_map_t tags)
+    : Napi::AsyncWorker(callback), isBuf(false), fileName(fileName), tags(tags) {}
 
-  // Should become protected...
-  tag_map_t tags;
+  SetTagsWorker(Napi::Function& callback, const char* buf, const size_t len, tag_map_t tags)
+    : Napi::AsyncWorker(callback), isBuf(true), bufLen(len), tags(tags) {
+    // Copy the buffer data since it may be garbage collected before Execute runs
+    bufCopy = new Exiv2::byte[len];
+    memcpy(bufCopy, buf, len);
+    this->buf = bufCopy;
+  }
 
-  // Executed inside the worker-thread. Not safe to access V8, or V8 data
-  // structures here.
-  void Execute () {
+  ~SetTagsWorker() {
+    if (bufCopy) {
+      delete[] bufCopy;
+    }
+  }
+
+  void Execute() override {
     try {
       #if USE_EXIV2_UNIQUE_PTR
-        Exiv2::Image::UniquePtr image = this->image();
+        Exiv2::Image::UniquePtr image = this->isBuf
+          ? Exiv2::ImageFactory::open(this->buf, this->bufLen)
+          : Exiv2::ImageFactory::open(this->fileName);
       #else
-        Exiv2::Image::AutoPtr image = this->image();
+        Exiv2::Image::AutoPtr image = this->isBuf
+          ? Exiv2::ImageFactory::open(this->buf, this->bufLen)
+          : Exiv2::ImageFactory::open(this->fileName);
       #endif
-      assert(image.get() != 0);
+      if (!image.get()) {
+        exifException = "Failed to open image";
+        return;
+      }
 
       image->readMetadata();
       Exiv2::ExifData &exifData = image->exifData();
@@ -194,8 +196,6 @@ class SetTagsWorker : public Exiv2Worker {
           iptcData[i->first].setValue(i->second);
         } else if (i->first.compare(0, 4, "Xmp.") == 0) {
           xmpData[i->first].setValue(i->second);
-        } else {
-          //std::cerr << "skipping unknown tag " << i->first << std::endl;
         }
       }
 
@@ -205,84 +205,126 @@ class SetTagsWorker : public Exiv2Worker {
       image->setXmpData(xmpData);
       image->writeMetadata();
     } catch (std::exception& e) {
-      exifException.append(e.what());
+      exifException = e.what();
     }
   }
 
-  // This function will be run inside the main event loop so it is safe to use
-  // V8 again.
-  void HandleOKCallback () {
-    Nan::HandleScope scope;
+  void OnOK() override {
+    Napi::HandleScope scope(Env());
 
-    // Create an argument array for any errors.
-    Local<Value> argv[1] = { Nan::Null() };
     if (!exifException.empty()) {
-      argv[0] = Nan::New<String>(exifException.c_str()).ToLocalChecked();
+      Callback().Call({Napi::String::New(Env(), exifException)});
+    } else {
+      Callback().Call({Env().Null()});
     }
+  }
 
-    // Pass the argv array object to our callback function.
-    Nan::Call(callback->GetFunction(), Nan::GetCurrentContext()->Global(), 1, argv);
-  };
+ protected:
+  const bool isBuf;
+  const Exiv2::byte* buf = nullptr;
+  Exiv2::byte* bufCopy = nullptr;
+  const size_t bufLen = 0;
+  const std::string fileName = "";
+  std::string exifException;
+  tag_map_t tags;
 };
 
-NAN_METHOD(SetImageTags) {
-  Nan::HandleScope scope;
+Napi::Value SetImageTags(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
 
-  /* Usage arguments */
-  if (info.Length() <= 2 || !info[2]->IsFunction())
-    return Nan::ThrowTypeError("Usage: <filename> <tags> <callback function>");
+  if (info.Length() <= 2 || !info[2].IsFunction()) {
+    Napi::TypeError::New(env, "Usage: <filename/buffer> <tags> <callback function>").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
 
-  Nan::Callback *callback = new Nan::Callback(info[2].As<Function>());
-  std::string filename = std::string(*Nan::Utf8String(info[0]));
+  Napi::Function callback = info[2].As<Napi::Function>();
 
-  SetTagsWorker *worker;
-  if (info[0]->IsString()) {
-    std::string filename = std::string(*Nan::Utf8String(info[0]));
-    worker = new SetTagsWorker(callback, filename);
+  // Validate second argument is an object
+  if (!info[1].IsObject() || info[1].IsArray()) {
+    Napi::TypeError::New(env, "Second argument must be an object of tags").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  // Extract tags from the second argument
+  tag_map_t tags;
+  Napi::Object tagsObj = info[1].As<Napi::Object>();
+  Napi::Array keys = tagsObj.GetPropertyNames();
+  for (uint32_t i = 0; i < keys.Length(); i++) {
+    Napi::Value key = keys.Get(i);
+    Napi::Value value = tagsObj.Get(key);
+
+    // Coerce values to strings
+    std::string keyStr = key.As<Napi::String>().Utf8Value();
+    std::string valueStr;
+    if (value.IsString()) {
+      valueStr = value.As<Napi::String>().Utf8Value();
+    } else if (value.IsNumber()) {
+      double d = value.As<Napi::Number>().DoubleValue();
+      // Format integers without decimal places
+      if (std::isfinite(d) && d == std::floor(d)) {
+        valueStr = std::to_string(static_cast<int64_t>(d));
+      } else {
+        valueStr = std::to_string(d);
+      }
+    } else {
+      // Try to coerce to string via ToString()
+      valueStr = value.ToString().Utf8Value();
+    }
+    tags.insert(std::pair<std::string, std::string>(keyStr, valueStr));
+  }
+
+  if (info[0].IsString()) {
+    std::string filename = info[0].As<Napi::String>().Utf8Value();
+    SetTagsWorker* worker = new SetTagsWorker(callback, filename, tags);
+    worker->Queue();
+  } else if (info[0].IsBuffer()) {
+    Napi::Buffer<char> buf = info[0].As<Napi::Buffer<char>>();
+    SetTagsWorker* worker = new SetTagsWorker(callback, buf.Data(), buf.Length(), tags);
+    worker->Queue();
   } else {
-    Local<Object> buf;
-    info[0]->ToObject(Nan::GetCurrentContext()).ToLocal(&buf);
-
-    worker = new SetTagsWorker(callback, Buffer::Data(buf), Buffer::Length(buf));
+    Napi::TypeError::New(env, "First argument must be a string or buffer").ThrowAsJavaScriptException();
+    return env.Undefined();
   }
 
-  Local<Object> tags = Local<Object>::Cast(info[1]);
-  Local<Array> keys = Nan::GetOwnPropertyNames(tags).ToLocalChecked();
-  for (unsigned i = 0; i < keys->Length(); i++) {
-    Local<Value> key = Nan::Get(keys, i).ToLocalChecked();
-    worker->tags.insert(std::pair<std::string, std::string> (
-      *Nan::Utf8String(key),
-      *Nan::Utf8String(Nan::Get(tags, key).ToLocalChecked())
-    ));
-  }
-
-  Nan::AsyncQueueWorker(worker);
-  return;
+  return env.Undefined();
 }
 
-// - - -
+// - - - DeleteTagsWorker - - -
 
-class DeleteTagsWorker : public Exiv2Worker {
+class DeleteTagsWorker : public Napi::AsyncWorker {
  public:
-  DeleteTagsWorker(Nan::Callback *callback, const std::string fileName)
-    : Exiv2Worker(callback, fileName) {}
-  DeleteTagsWorker(Nan::Callback *callback, const char* buf, const long len)
-    : Exiv2Worker(callback, buf, len) {}
-  ~DeleteTagsWorker() {}
+  DeleteTagsWorker(Napi::Function& callback, const std::string fileName, std::vector<std::string> tags)
+    : Napi::AsyncWorker(callback), isBuf(false), fileName(fileName), tags(tags) {}
 
-  // Should become protected...
-  std::vector<std::string> tags;
+  DeleteTagsWorker(Napi::Function& callback, const char* buf, const size_t len, std::vector<std::string> tags)
+    : Napi::AsyncWorker(callback), isBuf(true), bufLen(len), tags(tags) {
+    // Copy the buffer data since it may be garbage collected before Execute runs
+    bufCopy = new Exiv2::byte[len];
+    memcpy(bufCopy, buf, len);
+    this->buf = bufCopy;
+  }
 
-  // Executed inside the worker-thread. Not safe to access V8, or V8 data
-  // structures here.
-  void Execute () {
+  ~DeleteTagsWorker() {
+    if (bufCopy) {
+      delete[] bufCopy;
+    }
+  }
+
+  void Execute() override {
     try {
       #if USE_EXIV2_UNIQUE_PTR
-        Exiv2::Image::UniquePtr image = this->image();
+        Exiv2::Image::UniquePtr image = this->isBuf
+          ? Exiv2::ImageFactory::open(this->buf, this->bufLen)
+          : Exiv2::ImageFactory::open(this->fileName);
       #else
-        Exiv2::Image::AutoPtr image = this->image();
+        Exiv2::Image::AutoPtr image = this->isBuf
+          ? Exiv2::ImageFactory::open(this->buf, this->bufLen)
+          : Exiv2::ImageFactory::open(this->fileName);
       #endif
-      assert(image.get() != 0);
+      if (!image.get()) {
+        exifException = "Failed to open image";
+        return;
+      }
 
       image->readMetadata();
       Exiv2::ExifData &exifData = image->exifData();
@@ -292,19 +334,23 @@ class DeleteTagsWorker : public Exiv2Worker {
       // Erase the tags.
       for (std::vector<std::string>::iterator i = tags.begin(); i != tags.end(); ++i) {
         if (i->compare(0, 5, "Exif.") == 0) {
-          Exiv2::ExifKey *k = new Exiv2::ExifKey(*i);
-          exifData.erase(exifData.findKey(*k));
-          delete k;
+          Exiv2::ExifKey k(*i);
+          Exiv2::ExifData::iterator pos = exifData.findKey(k);
+          if (pos != exifData.end()) {
+            exifData.erase(pos);
+          }
         } else if (i->compare(0, 5, "Iptc.") == 0) {
-          Exiv2::IptcKey *k = new Exiv2::IptcKey(*i);
-          iptcData.erase(iptcData.findKey(*k));
-          delete k;
+          Exiv2::IptcKey k(*i);
+          Exiv2::IptcData::iterator pos = iptcData.findKey(k);
+          if (pos != iptcData.end()) {
+            iptcData.erase(pos);
+          }
         } else if (i->compare(0, 4, "Xmp.") == 0) {
-          Exiv2::XmpKey *k = new Exiv2::XmpKey(*i);
-          xmpData.erase(xmpData.findKey(*k));
-          delete k;
-        } else {
-          //std::cerr << "skipping unknown tag " << i << std::endl;
+          Exiv2::XmpKey k(*i);
+          Exiv2::XmpData::iterator pos = xmpData.findKey(k);
+          if (pos != xmpData.end()) {
+            xmpData.erase(pos);
+          }
         }
       }
 
@@ -314,137 +360,186 @@ class DeleteTagsWorker : public Exiv2Worker {
       image->setXmpData(xmpData);
       image->writeMetadata();
     } catch (std::exception& e) {
-      exifException.append(e.what());
+      exifException = e.what();
     }
   }
 
-  // This function will be run inside the main event loop so it is safe to use
-  // V8 again.
-  void HandleOKCallback () {
-    Nan::HandleScope scope;
+  void OnOK() override {
+    Napi::HandleScope scope(Env());
 
-    // Create an argument array for any errors.
-    Local<Value> argv[1] = { Nan::Null() };
     if (!exifException.empty()) {
-      argv[0] = Nan::New<String>(exifException.c_str()).ToLocalChecked();
+      Callback().Call({Napi::String::New(Env(), exifException)});
+    } else {
+      Callback().Call({Env().Null()});
     }
+  }
 
-    // Pass the argv array object to our callback function.
-    Nan::Call(callback->GetFunction(), Nan::GetCurrentContext()->Global(), 1, argv);
-  };
+ protected:
+  const bool isBuf;
+  const Exiv2::byte* buf = nullptr;
+  Exiv2::byte* bufCopy = nullptr;
+  const size_t bufLen = 0;
+  const std::string fileName = "";
+  std::string exifException;
+  std::vector<std::string> tags;
 };
 
-NAN_METHOD(DeleteImageTags) {
-  Nan::HandleScope scope;
+Napi::Value DeleteImageTags(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
 
-  /* Usage arguments */
-  if (info.Length() <= 2 || !info[2]->IsFunction())
-    return Nan::ThrowTypeError("Usage: <filename> <tags> <callback function>");
+  if (info.Length() <= 2 || !info[2].IsFunction()) {
+    Napi::TypeError::New(env, "Usage: <filename/buffer> <tags> <callback function>").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
 
-  Nan::Callback *callback = new Nan::Callback(info[2].As<Function>());
-  std::string filename = std::string(*Nan::Utf8String(info[0]));
+  Napi::Function callback = info[2].As<Napi::Function>();
 
-  DeleteTagsWorker *worker;
-  if (info[0]->IsString()) {
-    std::string filename = std::string(*Nan::Utf8String(info[0]));
-    worker = new DeleteTagsWorker(callback, filename);
+  // Validate second argument is an array
+  if (!info[1].IsArray()) {
+    Napi::TypeError::New(env, "Second argument must be an array of tag names").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  // Extract tags from the second argument (array of tag names to delete)
+  std::vector<std::string> tags;
+  Napi::Array keysArray = info[1].As<Napi::Array>();
+  for (uint32_t i = 0; i < keysArray.Length(); i++) {
+    Napi::Value key = keysArray.Get(i);
+    // Handle non-string values gracefully
+    if (key.IsString()) {
+      tags.push_back(key.As<Napi::String>().Utf8Value());
+    } else {
+      // Coerce to string
+      tags.push_back(key.ToString().Utf8Value());
+    }
+  }
+
+  if (info[0].IsString()) {
+    std::string filename = info[0].As<Napi::String>().Utf8Value();
+    DeleteTagsWorker* worker = new DeleteTagsWorker(callback, filename, tags);
+    worker->Queue();
+  } else if (info[0].IsBuffer()) {
+    Napi::Buffer<char> buf = info[0].As<Napi::Buffer<char>>();
+    DeleteTagsWorker* worker = new DeleteTagsWorker(callback, buf.Data(), buf.Length(), tags);
+    worker->Queue();
   } else {
-    Local<Object> buf;
-    info[0]->ToObject(Nan::GetCurrentContext()).ToLocal(&buf);
-
-    worker = new DeleteTagsWorker(callback, Buffer::Data(buf), Buffer::Length(buf));
+    Napi::TypeError::New(env, "First argument must be a string or buffer").ThrowAsJavaScriptException();
+    return env.Undefined();
   }
 
-  Local<Array> keys = Local<Array>::Cast(info[1]);
-  for (unsigned i = 0; i < keys->Length(); i++) {
-    Local<v8::Value> key = Nan::Get(keys, i).ToLocalChecked();
-    worker->tags.push_back(*Nan::Utf8String(key));
-  }
-
-  Nan::AsyncQueueWorker(worker);
-  return;
+  return env.Undefined();
 }
 
-// - - -
+// - - - GetPreviewsWorker - - -
 
-class GetPreviewsWorker : public Exiv2Worker {
+class GetPreviewsWorker : public Napi::AsyncWorker {
  public:
-  GetPreviewsWorker(Nan::Callback *callback, const std::string fileName)
-    : Exiv2Worker(callback, fileName) {}
-  GetPreviewsWorker(Nan::Callback *callback, const char* buf, const long len)
-    : Exiv2Worker(callback, buf, len) {}
-  ~GetPreviewsWorker() {}
+  GetPreviewsWorker(Napi::Function& callback, const std::string fileName)
+    : Napi::AsyncWorker(callback), isBuf(false), fileName(fileName) {}
 
-  // Executed inside the worker-thread. Not safe to access V8, or V8 data
-  // structures here.
-  void Execute () {
+  GetPreviewsWorker(Napi::Function& callback, const char* buf, const size_t len)
+    : Napi::AsyncWorker(callback), isBuf(true), bufLen(len) {
+    // Copy the buffer data since it may be garbage collected before Execute runs
+    bufCopy = new Exiv2::byte[len];
+    memcpy(bufCopy, buf, len);
+    this->buf = bufCopy;
+  }
+
+  ~GetPreviewsWorker() {
+    if (bufCopy) {
+      delete[] bufCopy;
+    }
+  }
+
+  void Execute() override {
     try {
       #if USE_EXIV2_UNIQUE_PTR
-        Exiv2::Image::UniquePtr image = this->image();
+        Exiv2::Image::UniquePtr image = this->isBuf
+          ? Exiv2::ImageFactory::open(this->buf, this->bufLen)
+          : Exiv2::ImageFactory::open(this->fileName);
       #else
-        Exiv2::Image::AutoPtr image = this->image();
+        Exiv2::Image::AutoPtr image = this->isBuf
+          ? Exiv2::ImageFactory::open(this->buf, this->bufLen)
+          : Exiv2::ImageFactory::open(this->fileName);
       #endif
-      assert(image.get() != 0);
+      if (!image.get()) {
+        exifException = "Failed to open image";
+        return;
+      }
       image->readMetadata();
 
       Exiv2::PreviewManager manager(*image);
       Exiv2::PreviewPropertiesList list = manager.getPreviewProperties();
 
-      // Make sure we're not reusing a baton with memory allocated.
       for (Exiv2::PreviewPropertiesList::iterator pos = list.begin(); pos != list.end(); pos++) {
-        Exiv2::PreviewImage image = manager.getPreviewImage(*pos);
+        Exiv2::PreviewImage previewImage = manager.getPreviewImage(*pos);
 
-        previews.push_back(Preview(image.mimeType(), image.height(),
-          image.width(), (char*) image.pData(), image.size()));
+        previews.emplace_back(previewImage.mimeType(), previewImage.height(),
+          previewImage.width(), (char*)previewImage.pData(), previewImage.size());
       }
     } catch (std::exception& e) {
-      exifException.append(e.what());
+      exifException = e.what();
     }
   }
 
-  // This function will be run inside the main event loop so it is safe to use
-  // V8 again.
-  void HandleOKCallback () {
-    Nan::HandleScope scope;
+  void OnOK() override {
+    Napi::HandleScope scope(Env());
 
-    Local<Value> argv[2] = { Nan::Null(), Nan::Null() };
-    if (!exifException.empty()){
-      argv[0] = Nan::New<String>(exifException.c_str()).ToLocalChecked();
+    if (!exifException.empty()) {
+      Callback().Call({Napi::String::New(Env(), exifException), Env().Null()});
     } else {
-      // Convert the data into V8 values.
-      Local<Array> array = Nan::New<Array>(previews.size());
+      Napi::Array array = Napi::Array::New(Env(), previews.size());
       for (size_t i = 0; i < previews.size(); ++i) {
-        Local<Object> preview = Nan::New<Object>();
-        Nan::Set(preview, Nan::New<String>("mimeType").ToLocalChecked(), Nan::New<String>(previews[i].mimeType.c_str()).ToLocalChecked());
-        Nan::Set(preview, Nan::New<String>("height").ToLocalChecked(), Nan::New<Number>(previews[i].height));
-        Nan::Set(preview, Nan::New<String>("width").ToLocalChecked(), Nan::New<Number>(previews[i].width));
-        Nan::Set(preview, Nan::New<String>("data").ToLocalChecked(), Nan::CopyBuffer(previews[i].data, previews[i].size).ToLocalChecked());
-
-        Nan::Set(array, i, preview);
+        Napi::Object preview = Napi::Object::New(Env());
+        preview.Set("mimeType", previews[i].mimeType);
+        preview.Set("height", Napi::Number::New(Env(), previews[i].height));
+        preview.Set("width", Napi::Number::New(Env(), previews[i].width));
+        preview.Set("data", Napi::Buffer<char>::Copy(Env(), previews[i].data, previews[i].size));
+        array.Set(i, preview);
       }
-      argv[1] = array;
+      Callback().Call({Env().Null(), array});
     }
-
-    // Pass the argv array object to our callback function.
-    Nan::Call(callback->GetFunction(), Nan::GetCurrentContext()->Global(), 2, argv);
-  };
+  }
 
  protected:
-
-  // Holds a preview image when we copy it from the worker to V8.
   struct Preview {
-    Preview(const Preview &p)
-      : mimeType(p.mimeType), height(p.height), width(p.width), size(p.size)
-    {
-      data = new char[size];
-      memcpy(data, p.data, size);
-    }
+    // Constructor
     Preview(std::string type_, uint32_t height_, uint32_t width_, const char *data_, size_t size_)
-      : mimeType(type_), height(height_), width(width_), size(size_)
-    {
-      data = new char[size];
-      memcpy(data, data_, size);
+      : mimeType(std::move(type_)), height(height_), width(width_), size(size_), data(nullptr) {
+      if (size > 0 && data_) {
+        data = new char[size];
+        memcpy(data, data_, size);
+      }
     }
+
+    // Delete copy constructor and copy assignment (Rule of Five)
+    Preview(const Preview&) = delete;
+    Preview& operator=(const Preview&) = delete;
+
+    // Move constructor
+    Preview(Preview&& other) noexcept
+      : mimeType(std::move(other.mimeType)), height(other.height), width(other.width),
+        size(other.size), data(other.data) {
+      other.data = nullptr;
+      other.size = 0;
+    }
+
+    // Move assignment operator
+    Preview& operator=(Preview&& other) noexcept {
+      if (this != &other) {
+        delete[] data;
+        mimeType = std::move(other.mimeType);
+        height = other.height;
+        width = other.width;
+        size = other.size;
+        data = other.data;
+        other.data = nullptr;
+        other.size = 0;
+      }
+      return *this;
+    }
+
+    // Destructor
     ~Preview() {
       delete[] data;
     }
@@ -456,52 +551,49 @@ class GetPreviewsWorker : public Exiv2Worker {
     char* data;
   };
 
+  const bool isBuf;
+  const Exiv2::byte* buf = nullptr;
+  Exiv2::byte* bufCopy = nullptr;
+  const size_t bufLen = 0;
+  const std::string fileName = "";
+  std::string exifException;
   std::vector<Preview> previews;
 };
 
-NAN_METHOD(GetImagePreviews) {
-  Nan::HandleScope scope;
+Napi::Value GetImagePreviews(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
 
-  /* Usage arguments */
-  if (info.Length() <= 1 || !info[1]->IsFunction())
-    return Nan::ThrowTypeError("Usage: <filename/buffer> <callback function>");
-
-  Nan::Callback *callback = new Nan::Callback(info[1].As<Function>());
-  std::string filename = std::string(*Nan::Utf8String(info[0]));
-
-  if (info[0]->IsString()) {
-    std::string filename = std::string(*Nan::Utf8String(info[0]));
-    Nan::AsyncQueueWorker(new GetPreviewsWorker(callback, filename));
-  } else {
-    Local<Object> buf;
-    info[0]->ToObject(Nan::GetCurrentContext()).ToLocal(&buf);
-
-    Nan::AsyncQueueWorker(new GetPreviewsWorker(callback, Buffer::Data(buf), Buffer::Length(buf)));
+  if (info.Length() <= 1 || !info[1].IsFunction()) {
+    Napi::TypeError::New(env, "Usage: <filename/buffer> <callback function>").ThrowAsJavaScriptException();
+    return env.Undefined();
   }
-  return;
+
+  Napi::Function callback = info[1].As<Napi::Function>();
+
+  if (info[0].IsString()) {
+    std::string filename = info[0].As<Napi::String>().Utf8Value();
+    GetPreviewsWorker* worker = new GetPreviewsWorker(callback, filename);
+    worker->Queue();
+  } else if (info[0].IsBuffer()) {
+    Napi::Buffer<char> buf = info[0].As<Napi::Buffer<char>>();
+    GetPreviewsWorker* worker = new GetPreviewsWorker(callback, buf.Data(), buf.Length());
+    worker->Queue();
+  } else {
+    Napi::TypeError::New(env, "First argument must be a string or buffer").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  return env.Undefined();
 }
 
-// - - -
-void InitAll(Local<Object> target) {
-  Nan::Set(
-    target,
-    Nan::New<String>("getImageTags").ToLocalChecked(),
-    Nan::GetFunction(Nan::New<FunctionTemplate>(GetImageTags)).ToLocalChecked()
-  );
-  Nan::Set(
-    target,
-    Nan::New<String>("setImageTags").ToLocalChecked(),
-    Nan::GetFunction(Nan::New<FunctionTemplate>(SetImageTags)).ToLocalChecked()
-  );
-  Nan::Set(
-    target,
-    Nan::New<String>("deleteImageTags").ToLocalChecked(),
-    Nan::GetFunction(Nan::New<FunctionTemplate>(DeleteImageTags)).ToLocalChecked()
-  );
-  Nan::Set(
-    target,
-    Nan::New<String>("getImagePreviews").ToLocalChecked(),
-    Nan::GetFunction(Nan::New<FunctionTemplate>(GetImagePreviews)).ToLocalChecked()
-  );
+// - - - Module Init - - -
+
+Napi::Object InitAll(Napi::Env env, Napi::Object exports) {
+  exports.Set("getImageTags", Napi::Function::New(env, GetImageTags));
+  exports.Set("setImageTags", Napi::Function::New(env, SetImageTags));
+  exports.Set("deleteImageTags", Napi::Function::New(env, DeleteImageTags));
+  exports.Set("getImagePreviews", Napi::Function::New(env, GetImagePreviews));
+  return exports;
 }
-NODE_MODULE(exiv2, InitAll)
+
+NODE_API_MODULE(exiv2, InitAll)

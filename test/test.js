@@ -68,7 +68,7 @@ describe('exiv2', function(){
     });
 
     it('should report an error on an empty buffer', function(done) {
-      exiv.getImageTags(new Buffer(''), function(err, tags) {
+      exiv.getImageTags(Buffer.alloc(0), function(err, tags) {
         should.exist(err);
         should.not.exist(tags);
         done();
@@ -126,6 +126,12 @@ describe('exiv2', function(){
         done();
       });
     });
+
+    it('should throw if tags is not an object', function() {
+      (function(){
+        exiv.setImageTags(dir + '/books.jpg', ['not', 'an', 'object'], function(){})
+      }).should.throw(/must be an object/);
+    });
   });
 
   describe('.deleteImageTags()', function(){
@@ -148,6 +154,12 @@ describe('exiv2', function(){
     })
     after(function(done) {
       fs.unlink(temp, done);
+    });
+
+    it('should throw if tags is not an array', function() {
+      (function(){
+        exiv.deleteImageTags(dir + '/books.jpg', {'not': 'an array'}, function(){})
+      }).should.throw(/must be an array/);
     });
   });
 
@@ -230,7 +242,7 @@ describe('exiv2', function(){
 
     it("should return a Date", function() {
       var d = exiv.getDate(tags);
-      should.ok(util.isDate(d));
+      should.ok(d instanceof Date);
     });
 
     it("should be the correct date and time", function() {

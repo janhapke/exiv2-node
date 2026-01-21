@@ -1,3 +1,11 @@
+## 0.7.3 (2026-01-21)
+
+* Migrate from `nan` to `node-addon-api` for Node.js v24+ compatibility
+* Minimum Node.js version is now 18.0.0
+* Fix potential memory issues in Preview struct (proper move semantics)
+* Add input validation for `setImageTags` and `deleteImageTags`
+* Replace `assert()` with proper error handling in async workers
+
 ## 0.7.2 (2023-10-18)
 
 * Make backwards compatible with versions lower than v0.28.0
