@@ -16,17 +16,12 @@
   <a href="https://snyk.io/test/github/11ways/exiv2node?targetFile=package.json">
     <img src="https://snyk.io/test/github/11ways/exiv2node/badge.svg?targetFile=package.json" alt="Known Vulnerabilities" />
   </a>
-
-  <!-- DM - David -->
-  <a href="https://david-dm.org/11ways/exiv2node">
-    <img src="https://david-dm.org/11ways/exiv2node/status.svg" alt="Dependency Status" />
-  </a>
 </div>
 
 <div align="center">
   <!-- Version - npm -->
-  <a href="https://www.npmjs.com/package/@11ways/exiv2node">
-    <img src="https://img.shields.io/npm/v/exiv2node.svg" alt="Latest version on npm" />
+  <a href="https://www.npmjs.com/package/@11ways/exiv2">
+    <img src="https://img.shields.io/npm/v/@11ways/exiv2.svg" alt="Latest version on npm" />
   </a>
 
   <!-- License - MIT -->
@@ -56,11 +51,11 @@ It was created by Damian Beresford
 To build this addon you'll need the Exiv2 library and headers so if you're using
 a package manager you might need to install an additional "-dev" packages.
 
-### Debian
+### Debian / Ubuntu
 
-    apt-get install exiv2 libexiv2-dev
+    apt-get install pkg-config exiv2 libexiv2-dev
 
-### OS X
+### macOS
 
 You'll also need to install pkg-config to help locate the library and headers.
 
@@ -75,6 +70,10 @@ You'll also need to install pkg-config to help locate the library and headers.
 ### FreeBSD
 
     pkg install pkgconf exiv2
+
+### Arch Linux
+
+    pacman -S exiv2 pkgconf
 
 ### Windows
 Install pkg-config using [Chocolatey](https://chocolatey.org/):
@@ -94,12 +93,18 @@ For Electron apps, you'll want to copy `exiv2.dll` to the root directory of your
 See the [Exiv2 download page](http://www.exiv2.org/download.html) for more
 information.
 
+## Requirements
+
+- Node.js 18 or later
+- Exiv2 library and development headers (see Dependencies above)
+- pkg-config
+
 ## Installation Instructions
 
 Once the dependencies are in place, you can build and install the module using
 npm:
 
-    npm install exiv2
+    npm install @11ways/exiv2
 
 You can verify that everything is installed and operating correctly by running
 the tests:
@@ -110,7 +115,7 @@ the tests:
 
 ### Read tags:
 
-    var ex = require('exiv2');
+    var ex = require('@11ways/exiv2');
 
     ex.getImageTags('./photo.jpg', function(err, tags) {
       console.log("DateTime: " + tags["Exif.Image.DateTime"]);
@@ -126,7 +131,7 @@ the tests:
 
 ### Load preview images:
 
-    var ex = require('exiv2')
+    var ex = require('@11ways/exiv2')
       , fs = require('fs');
 
     ex.getImagePreviews('./photo.jpg', function(err, previews) {
@@ -140,7 +145,7 @@ the tests:
 
 ### Write tags:
 
-    var ex = require('exiv2')
+    var ex = require('@11ways/exiv2')
 
     var newTags = {
       "Exif.Photo.UserComment" : "Some Comment..",
@@ -156,7 +161,7 @@ the tests:
 
 ### Delete tags:
 
-    var ex = require('exiv2')
+    var ex = require('@11ways/exiv2')
 
     var tagsToDelete = ["Exif.Photo.UserComment", "Exif.Canon.OwnerName"];
     ex.deleteImageTags('./photo.jpg', tagsToDelete, function(err){
@@ -171,7 +176,7 @@ Take a look at the `examples/` and `test/` directories for more.
 
 ## Authors
 - **Damian Beresford** - Original creator
-- **Jelle De Loecker** -  *Follow* me on *Github* ([:octocat:@skerit](https://github.com/skerit)) and on  *Twitter* ([🐦@skeriten](http://twitter.com/intent/user?screen_name=skeriten))
+- **Jelle De Loecker** -  *Follow* me on *Github* ([:octocat:@skerit](https://github.com/skerit)) and on *Mastodon* ([🐦@skerit@elevenways.be](https://mastodon.elevenways.be/@skerit))
 
 See also the list of [contributors](https://github.com/11ways/exiv2node/contributors) who participated in this project.
 
