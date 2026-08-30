@@ -44,6 +44,24 @@
   </sub>
 </div>
 
+## Why this fork exists
+
+`@janhapke/exiv2` is a fork of [`@11ways/exiv2`](https://github.com/11ways/exiv2node), maintained by [Jan Hapke](https://github.com/janhapke). It exists to:
+
+- fix `getImageTags()` returning Exiv2's *raw* tag values instead of the *interpreted* ones — see [CHANGELOG.md](CHANGELOG.md) for the underlying bug and fix (e.g. a Nikon lens ID like `"154"` now correctly resolves to `"Nikon AF-S DX VR Zoom-Nikkor 18-55mm f/3.5-5.6G"`)
+- ship hand-written TypeScript declarations (`exiv2.d.ts`), which upstream has never had
+
+## Versioning scheme
+
+This fork tracks the [Exiv2](https://exiv2.org) C++ library version it's built and tested against, since correctness here depends directly on which native Exiv2 release resolves tag interpretation. Versions are `0.XXY.Z`:
+
+- **`XXY`** — the tracked Exiv2 version's minor and patch numbers concatenated (Exiv2 `0.28.8` → minor `28` + patch `8` → `288`). Compared numerically (not as zero-padded strings), so ordering stays correct even once the patch digit reaches double digits.
+- **`Z`** — this fork's own release counter for that Exiv2 version, starting at `0` and bumped for every fork-only change (a fix, a feature like type declarations, a metadata correction) that doesn't require bumping the tracked Exiv2 version.
+
+For example, `0.288.2` is this fork's 3rd release (`Z=2`) built against Exiv2 `0.28.8`.
+
+> **Note:** this fork's very first release (the interpreted-tags fix) was published as plain `0.28.8`, before this scheme was adopted. `0.288.0`/`0.288.1` were never published — release `1` would have been a repo-URL-only fix, folded into this changeover instead of shipping alone. Every release from `0.288.2` onward follows the scheme above.
+
 # Exiv2
 
 Exiv2 is a native C++ extension for [node.js](https://nodejs.org) that provides

@@ -1,7 +1,7 @@
 {
   "name": "@janhapke/exiv2",
   "description": "A native c++ extension for node.js that provides support for reading & writing image metadata via Exiv2. Fork of @11ways/exiv2 with a fix for interpreted (rather than raw) tag values.",
-  "version": "0.28.8",
+  "version": "0.288.2",
   "homepage": "https://github.com/janhapke/exiv2-node",
   "author": {
     "name": "Jelle De Loecker",
@@ -16,18 +16,21 @@
     "node-addon-api": "^8.0.0"
   },
   "devDependencies": {
+    "@types/node": "26.4.0",
     "mocha": "*",
-    "should": "*"
+    "should": "*",
+    "typescript": "7.0.2"
   },
-  "optionalDependencies": {},
   "engines": {
     "node": ">=18.0.0"
   },
   "main": "exiv2",
+  "types": "exiv2.d.ts",
   "scripts": {
     "test": "mocha",
     "clean": "node-gyp clean",
-    "build": "node-gyp configure build"
+    "build": "node-gyp configure build",
+    "typecheck": "tsc"
   },
   "gypfile": true,
   "contributors": [
