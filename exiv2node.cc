@@ -70,7 +70,7 @@ class GetTagsWorker : public Napi::AsyncWorker {
       if (exifData.empty() == false) {
         Exiv2::ExifData::const_iterator end = exifData.end();
         for (Exiv2::ExifData::const_iterator i = exifData.begin(); i != end; ++i) {
-          tags.insert(std::pair<std::string, std::string>(i->key(), i->value().toString()));
+          tags.insert(std::pair<std::string, std::string>(i->key(), i->print(&exifData)));
         }
       }
 
@@ -78,7 +78,7 @@ class GetTagsWorker : public Napi::AsyncWorker {
       if (iptcData.empty() == false) {
         Exiv2::IptcData::const_iterator end = iptcData.end();
         for (Exiv2::IptcData::const_iterator i = iptcData.begin(); i != end; ++i) {
-          tags.insert(std::pair<std::string, std::string>(i->key(), i->value().toString()));
+          tags.insert(std::pair<std::string, std::string>(i->key(), i->print()));
         }
       }
 
@@ -86,7 +86,7 @@ class GetTagsWorker : public Napi::AsyncWorker {
       if (xmpData.empty() == false) {
         Exiv2::XmpData::const_iterator end = xmpData.end();
         for (Exiv2::XmpData::const_iterator i = xmpData.begin(); i != end; ++i) {
-          tags.insert(std::pair<std::string, std::string>(i->key(), i->value().toString()));
+          tags.insert(std::pair<std::string, std::string>(i->key(), i->print()));
         }
       }
     } catch (std::exception& e) {

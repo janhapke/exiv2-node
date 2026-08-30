@@ -1,6 +1,11 @@
 <h1 align="center">
-  <b>@11ways/exiv2node</b>
+  <b>@janhapke/exiv2node</b>
 </h1>
+<div align="center">
+  <sub>
+    A fork of <a href="https://github.com/11ways/exiv2node">@11ways/exiv2node</a> that fixes interpreted (rather than raw) tag values.
+  </sub>
+</div>
 <div align="center">
   <!-- CI - Github Actions -->
   <a href="https://github.com/11ways/exiv2node/actions/workflows/unit_test.yaml">
@@ -104,18 +109,31 @@ information.
 Once the dependencies are in place, you can build and install the module using
 npm:
 
-    npm install @11ways/exiv2
+    npm install @janhapke/exiv2
 
 You can verify that everything is installed and operating correctly by running
 the tests:
 
     npm test
 
+## Interpreted vs. raw tag values
+
+Unlike the upstream `@11ways/exiv2` package, `getImageTags()` here returns
+**interpreted** tag values (via Exiv2's `Metadatum::print()`) instead of
+**raw** ones (via `Value::toString()`). This matters for tags whose stored
+value needs manufacturer-specific decoding to be meaningful, e.g.:
+
+    // Exif.NikonLd2.LensIDNumber
+    // before: "154"
+    // after:  "Nikon AF-S DX VR Zoom-Nikkor 18-55mm f/3.5-5.6G"
+
+See [CHANGELOG.md](CHANGELOG.md) for details.
+
 ## Sample Usage
 
 ### Read tags:
 
-    var ex = require('@11ways/exiv2');
+    var ex = require('@janhapke/exiv2');
 
     ex.getImageTags('./photo.jpg', function(err, tags) {
       console.log("DateTime: " + tags["Exif.Image.DateTime"]);
@@ -131,7 +149,7 @@ the tests:
 
 ### Load preview images:
 
-    var ex = require('@11ways/exiv2')
+    var ex = require('@janhapke/exiv2')
       , fs = require('fs');
 
     ex.getImagePreviews('./photo.jpg', function(err, previews) {
@@ -145,7 +163,7 @@ the tests:
 
 ### Write tags:
 
-    var ex = require('@11ways/exiv2')
+    var ex = require('@janhapke/exiv2')
 
     var newTags = {
       "Exif.Photo.UserComment" : "Some Comment..",
@@ -161,7 +179,7 @@ the tests:
 
 ### Delete tags:
 
-    var ex = require('@11ways/exiv2')
+    var ex = require('@janhapke/exiv2')
 
     var tagsToDelete = ["Exif.Photo.UserComment", "Exif.Canon.OwnerName"];
     ex.deleteImageTags('./photo.jpg', tagsToDelete, function(err){
@@ -177,10 +195,11 @@ Take a look at the `examples/` and `test/` directories for more.
 ## Authors
 - **Damian Beresford** - Original creator
 - **Jelle De Loecker** -  *Follow* me on *Github* ([:octocat:@skerit](https://github.com/skerit)) and on *Mastodon* ([🐦@skerit@elevenways.be](https://mastodon.elevenways.be/@skerit))
+- **Jan Hapke** - Maintainer of this fork ([@janhapke](https://github.com/janhapke))
 
-See also the list of [contributors](https://github.com/11ways/exiv2node/contributors) who participated in this project.
+See also the list of [contributors](https://github.com/11ways/exiv2node/contributors) who participated in the upstream project, and [AUTHORS](AUTHORS) for this fork.
 
-@11ways/exiv2node is developed at [Eleven Ways](https://www.elevenways.be/), a team of [IAAP Certified Accessibility Specialists](https://www.accessibilityassociation.org/).
+The original @11ways/exiv2node is developed at [Eleven Ways](https://www.elevenways.be/), a team of [IAAP Certified Accessibility Specialists](https://www.accessibilityassociation.org/).
 
 ## License
 This project is licensed under the MIT License - see the [LICENSE](https://github.com/11ways/exiv2node/LICENSE) file for details.
