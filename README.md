@@ -53,14 +53,16 @@
 
 ## Versioning scheme
 
-This fork tracks the [Exiv2](https://exiv2.org) C++ library version it's built and tested against, since correctness here depends directly on which native Exiv2 release resolves tag interpretation. Versions are `0.XXY.Z`:
+This fork tracks the [Exiv2](https://exiv2.org) C++ library version it's built and tested against, since correctness here depends directly on which native Exiv2 release resolves tag interpretation. Versions are `0.XXYY.Z`:
 
-- **`XXY`** — the tracked Exiv2 version's minor and patch numbers concatenated (Exiv2 `0.28.8` → minor `28` + patch `8` → `288`). Compared numerically (not as zero-padded strings), so ordering stays correct even once the patch digit reaches double digits.
+- **`XXYY`** — the tracked Exiv2 version's minor number followed by its patch number, zero-padded to 2 digits, concatenated (Exiv2 `0.28.8` → minor `28` + patch `08` → `2808`).
 - **`Z`** — this fork's own release counter for that Exiv2 version, starting at `0` and bumped for every fork-only change (a fix, a feature like type declarations, a metadata correction) that doesn't require bumping the tracked Exiv2 version.
 
-For example, `0.288.2` is this fork's 3rd release (`Z=2`) built against Exiv2 `0.28.8`.
+For example, `0.2808.2` is this fork's 3rd release (`Z=2`) built against Exiv2 `0.28.8`.
 
-> **Note:** this fork's very first release (the interpreted-tags fix) was published as plain `0.28.8`, before this scheme was adopted. `0.288.0`/`0.288.1` were never published — release `1` would have been a repo-URL-only fix, folded into this changeover instead of shipping alone. Every release from `0.288.2` onward follows the scheme above.
+The patch number is zero-padded (not left as a bare concatenation) because Exiv2's minor version has already grown from 1 digit to 2 (`0.9` → `0.10`, and never dropped back), and its patch number has already reached `8` in the current `0.28.x` line — one release away from testing a double-digit patch. An unpadded `XXY` scheme breaks the moment a minor bump happens while the old minor's patch was already double digits: e.g. Exiv2 `0.28.10` would concatenate to `2810`, but `0.29.0` would concatenate to `290` — and since semver compares these as plain numbers, `2810 > 290` would make the fork version for the *older* `0.28.10` sort as newer than the fork version for `0.29.0`. Zero-padding the patch to a fixed 2-digit width keeps every comparison monotonic no matter how the digit counts change (assuming Exiv2's patch number stays under 100, comfortably true for the foreseeable future).
+
+> **Note:** this fork's very first release (the interpreted-tags fix) was published as plain `0.28.8`, before this scheme was adopted. Every release from `0.2808.2` onward follows the scheme above.
 
 # Exiv2
 

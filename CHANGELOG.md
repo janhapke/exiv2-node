@@ -1,4 +1,4 @@
-## 0.288.2 (2026-08-30) - @janhapke/exiv2 fork
+## 0.2808.2 (2026-08-30) - @janhapke/exiv2 fork
 
 * **Add:** hand-written TypeScript declarations (`exiv2.d.ts`), covering the
   entire exported API surface — all four native bindings from
@@ -15,10 +15,15 @@
 * **Fix:** repo URLs in `package.json` (`homepage`, `repository.url`,
   `bugs.url`) pointed at `github.com/janhapke/exiv2node`; the fork
   actually lives at `github.com/janhapke/exiv2-node`.
-* **Change:** adopted a new versioning scheme, `0.XXY.Z` (`XXY` = tracked
-  Exiv2 version's minor+patch concatenated, `Z` = this fork's own release
-  counter for that Exiv2 version) — see the README's "Versioning scheme"
-  section. This is release `Z=2` against Exiv2 `0.28.8`.
+* **Change:** adopted a new versioning scheme, `0.XXYY.Z` (`XXYY` = tracked
+  Exiv2 version's minor number + 2-digit zero-padded patch number
+  concatenated, `Z` = this fork's own release counter for that Exiv2
+  version) — see the README's "Versioning scheme" section. Patch is
+  zero-padded rather than bare-concatenated because Exiv2's patch number
+  has already reached `8` in the `0.28.x` line; an unpadded scheme would
+  invert ordering the moment a minor bump (e.g. `0.29.0`) landed while an
+  older minor's patch was already double digits (e.g. `0.28.10`). This is
+  release `Z=2` against Exiv2 `0.28.8`.
 
 ## 0.28.8 (2026-08-30) - @janhapke/exiv2 fork
 
