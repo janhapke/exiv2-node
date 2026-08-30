@@ -1,5 +1,5 @@
 <h1 align="center">
-  <b>@janhapke/exiv2node</b>
+  <b>@janhapke/exiv2</b>
 </h1>
 <div align="center">
   <sub>
