@@ -149,6 +149,45 @@ value needs manufacturer-specific decoding to be meaningful, e.g.:
 
 See [CHANGELOG.md](CHANGELOG.md) for details.
 
+## Diagnostics / logging
+
+Exiv2's internal logger (`Exiv2::LogMsg`) writes its own `Warning:`/`Error:`
+diagnostics straight to `stderr` whenever it hits malformed image structure
+(e.g. a corrupted or truncated file), independently of whether the call
+you made succeeds. For example, `getImageTags()` can resolve normally with
+no tags and no error while Exiv2 has already printed something like:
+
+    Error: Directory Image with 572 entries considered invalid; not read.
+
+Two functions let you control this:
+
+    var ex = require('@janhapke/exiv2');
+
+    // Suppress Exiv2's diagnostics entirely.
+    ex.muteLog();
+    // ...equivalent to:
+    ex.setLogLevel('mute');
+
+    // Or route them into your own code instead of stderr.
+    ex.setLogHandler(function(event) {
+      console.log(event.level, event.message);
+    });
+
+    // Restore the default stderr output.
+    ex.setLogHandler(null);
+
+`setLogLevel()` accepts `'debug'`, `'info'`, `'warn'`, `'error'`, or
+`'mute'` (Exiv2's default level is `'warn'`); only messages at or above
+that severity reach the handler.
+
+**Caveat:** both of these control Exiv2's own process-global state, not
+anything scoped to a single call — they affect every `getImageTags()`/
+`setImageTags()`/`deleteImageTags()`/`getImagePreviews()` call in the
+process. A handler installed via `setLogHandler()` receives log events
+from whichever call happens to be running at the time; if multiple calls
+are in flight concurrently, there is no way to attribute a given message
+back to a specific one.
+
 ## Sample Usage
 
 ### Read tags:

@@ -1,3 +1,48 @@
+## 0.2808.3 (2026-09-13) - @janhapke/exiv2 fork
+
+* **Add:** `setLogLevel()`, `muteLog()`, and `setLogHandler()`, exposing
+  `Exiv2::LogMsg`'s level/handler controls (`error.hpp`) at the JS
+  boundary.
+
+  Exiv2's internal logger writes its own `Warning:`/`Error:` diagnostics
+  straight to `stderr` whenever it hits malformed TIFF/IFD structure (e.g.
+  a corrupted or truncated file) — entirely bypassing the JS callback.
+  `getImageTags()` and friends could resolve with no tags and no error
+  while Exiv2 had already logged something like `Directory Image with 572
+  entries considered invalid; not read.` with no way for a consumer to
+  suppress, redirect, or even detect it. See [issue
+  #1](https://github.com/janhapke/exiv2-node/issues/1).
+
+  `setLogLevel('debug'|'info'|'warn'|'error'|'mute')` and its `muteLog()`
+  shorthand map directly onto `Exiv2::LogMsg::setLevel()`.
+  `setLogHandler(fn | null)` installs a JS function receiving
+  `{level, message}` events instead of Exiv2's default `stderr` output
+  (`null` restores that default); the message text is passed through
+  exactly as Exiv2 composed it. See the README's new "Diagnostics /
+  logging" section for the full API and its process-global caveat
+  (`LogMsg::Handler` is a plain C function pointer with no per-call
+  context slot, so — like `setLogLevel()` — a handler installed via
+  `setLogHandler()` is shared by every in-flight call, not scoped to the
+  one that triggered it).
+
+  Log events are captured into a plain-data buffer from
+  `Exiv2::LogMsg`'s handler (which can run on a libuv worker-pool thread,
+  inside any of the four `AsyncWorker`s' `Execute()`), then delivered to
+  the installed JS handler synchronously from that worker's `OnOK()` —
+  which Node-API guarantees already runs on the main JS thread — rather
+  than through a `Napi::ThreadSafeFunction`, which was tried first but
+  raced the worker's own completion callback (Node-API's "blocking" call
+  mode only blocks when the delivery queue is full, not until the JS
+  callback has actually run).
+
+  Covered by a new `corrupt-ifd.jpg` fixture (`books.jpg` with its IFD0
+  entry count patched to a bogus `572`, reliably reproducing the bug) and
+  a `test/helpers/log-control-subprocess.js` helper — each scenario runs
+  in its own subprocess since Exiv2's default handler writes straight to
+  `std::cerr` (invisible to a `process.stderr.write` spy) and the new
+  functions are process-global state that must not leak between test
+  cases.
+
 ## 0.2808.2 (2026-08-30) - @janhapke/exiv2 fork
 
 * **Add:** hand-written TypeScript declarations (`exiv2.d.ts`), covering the

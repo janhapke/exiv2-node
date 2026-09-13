@@ -102,6 +102,66 @@ export function deleteImageTags(input: string | Buffer, tagNames: string[], call
 export function getImagePreviews(input: string | Buffer, callback: PreviewsCallback): void;
 
 /**
+ * Severity levels understood by `setLogLevel()`, mirroring Exiv2's own
+ * `Exiv2::LogMsg::Level` enum. `'mute'` suppresses every log message.
+ */
+export type LogLevel = 'debug' | 'info' | 'warn' | 'error' | 'mute';
+
+/**
+ * One diagnostic message Exiv2's internal logger (`Exiv2::LogMsg`) emitted
+ * while parsing or writing image metadata — e.g. malformed TIFF/IFD
+ * structure in a corrupt or truncated file. `message` is passed through
+ * exactly as Exiv2 composed it (including its own "Warning:"/"Error:"
+ * prefix), unmodified.
+ */
+export interface LogEvent {
+  level: LogLevel;
+  message: string;
+}
+
+/** Callback shape used by `setLogHandler()`. */
+export type LogHandler = (event: LogEvent) => void;
+
+/**
+ * Set Exiv2's internal log level. Only messages at or above this severity
+ * reach the installed handler (the default handler, or one installed via
+ * `setLogHandler()`); `'mute'` suppresses everything regardless of handler.
+ *
+ * This controls `Exiv2::LogMsg`'s own process-global state — it is not
+ * scoped to a single call, and affects every `getImageTags()`/
+ * `setImageTags()`/`deleteImageTags()`/`getImagePreviews()` call in the
+ * process, concurrent or not.
+ *
+ * @throws {TypeError} synchronously if `level` is missing or not one of
+ *   `'debug'`, `'info'`, `'warn'`, `'error'`, `'mute'`.
+ */
+export function setLogLevel(level: LogLevel): void;
+
+/**
+ * Shorthand for `setLogLevel('mute')` — suppresses every Exiv2 log message
+ * (see `setLogLevel()`'s process-global caveat).
+ */
+export function muteLog(): void;
+
+/**
+ * Install a handler that receives Exiv2's internal log messages as
+ * `{level, message}` events instead of them being written to `stderr`
+ * (Exiv2's own default). Pass `null` to remove a previously installed
+ * handler and restore the default `stderr` output.
+ *
+ * This replaces Exiv2's one process-wide log handler — like
+ * `setLogLevel()`, it is not scoped to a single call. Events from a given
+ * `getImageTags()`/etc. call are delivered to the handler synchronously,
+ * before that call's own callback fires, but if multiple calls are in
+ * flight concurrently their log messages share this one handler with no
+ * way to attribute a given message back to a specific call.
+ *
+ * @throws {TypeError} synchronously if `handler` is neither a function
+ *   nor `null`/`undefined`.
+ */
+export function setLogHandler(handler: LogHandler | null): void;
+
+/**
  * JS-level helper (not part of the native binding): converts an Exiv2
  * date-time tag string (e.g. "2012:04:14 17:45:52") from a tag map
  * previously returned by `getImageTags()` into a `Date`.
