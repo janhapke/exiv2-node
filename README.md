@@ -188,6 +188,19 @@ from whichever call happens to be running at the time; if multiple calls
 are in flight concurrently, there is no way to attribute a given message
 back to a specific one.
 
+## Concurrency
+
+`getImageTags()`, `setImageTags()`, `deleteImageTags()`, and
+`getImagePreviews()` all run off the main thread and are safe to call
+concurrently from JS — but internally, only one of them actually runs
+inside Exiv2 at a time; concurrent calls queue up and are serviced one
+after another. This is deliberate: Exiv2 itself isn't documented as safe
+for genuinely concurrent access (e.g. `Exiv2::XmpParser::initialize()`,
+lazily triggered the first time any image with XMP data is read, is
+explicitly documented as not thread-safe), so this addon trades away true
+multi-threaded parallelism for correctness rather than risk a native
+crash under concurrent use.
+
 ## Sample Usage
 
 ### Read tags:

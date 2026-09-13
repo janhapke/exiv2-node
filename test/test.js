@@ -283,6 +283,13 @@ describe('exiv2', function(){
       result.stderr.toString().should.match(/considered invalid/);
     });
 
+    it("a throwing setLogHandler() callback doesn't swallow the triggering call's own callback", function() {
+      var result = run('throwing-handler');
+      var parsed = JSON.parse(result.stdout.toString());
+      should.not.exist(parsed.err);
+      parsed.tagCount.should.equal(0);
+    });
+
     it('should throw synchronously for an invalid log level', function() {
       (function(){
         exiv.setLogLevel('bogus');

@@ -29,6 +29,23 @@
 // worker threads.
 typedef std::map<std::string, std::string> tag_map_t;
 
+// Serializes every call into Exiv2 across all four AsyncWorkers below. Each
+// worker's Execute() runs on a libuv worker-pool thread, so without this,
+// two workers' Execute() calls can run genuinely concurrently -- and Exiv2
+// itself is not documented as safe for that: e.g.
+// <exiv2/xmp_exiv2.hpp>'s XmpParser::initialize() (lazily triggered the
+// first time any image carrying XMP data is read) is explicitly documented
+// as "not thread-safe and needs to be called in a thread-safe manner (e.g.,
+// on program startup, before threads are created)". Two concurrent
+// first-ever XMP reads racing on that lazy init (or any other similarly
+// unsynchronized internal Exiv2 state -- XmpParser is just the one
+// instance that happens to be documented) is a plausible cause of hard,
+// unpredictable native crashes in a consumer that fires multiple calls
+// concurrently. Trading away true parallelism here is the
+// right call: Exiv2 was never validated for concurrent access, so letting
+// two calls race inside it isn't a real performance feature to give up.
+std::mutex gExiv2Mutex;
+
 // - - - Log control (Exiv2::LogMsg) - - -
 //
 // Exiv2::LogMsg writes its own internal diagnostics (malformed TIFF/IFD
@@ -105,9 +122,10 @@ void LogTrampoline(int level, const char* message) {
 
 // Delivers any log events buffered (via LogTrampoline) since the last
 // drain to the installed JS handler, in order, then clears the buffer.
-// Must run on the JS thread. Called from every AsyncWorker's OnOK() below,
-// before it invokes its own callback, so a consumer always sees a call's
-// log lines before that call's own result/error callback fires.
+// Must run on the JS thread. Called from every AsyncWorker's OnOK()/
+// OnError() below, before it invokes its own callback, so a consumer
+// always sees a call's log lines before that call's own result/error
+// callback fires.
 void DrainLogEvents(Napi::Env env) {
   std::vector<LogEvent> drained;
   {
@@ -127,7 +145,19 @@ void DrainLogEvents(Napi::Env env) {
     Napi::Object event = Napi::Object::New(env);
     event.Set("level", Napi::String::New(env, e.level));
     event.Set("message", Napi::String::New(env, e.message));
-    gLogHandlerRef.Call({event});
+    try {
+      gLogHandlerRef.Call({event});
+    } catch (const Napi::Error&) {
+      // A handler that throws must not take down the call that triggered
+      // it (NAPI_CPP_EXCEPTIONS turns a throwing JS callback into a C++
+      // exception here; left uncaught, it would unwind straight out of the
+      // calling worker's OnOK()/OnError(), skipping that call's own
+      // result/error callback entirely). Drop any remaining events from
+      // this drain and let the caller continue -- there's no good channel
+      // to report a broken log handler back through other than stderr.
+      fprintf(stderr, "@janhapke/exiv2: setLogHandler() callback threw; further diagnostics are being dropped until it's fixed\n");
+      break;
+    }
   }
 }
 
@@ -205,6 +235,7 @@ class GetTagsWorker : public Napi::AsyncWorker {
 
   // Executed inside the worker-thread. Not safe to access Napi values here.
   void Execute() override {
+    std::lock_guard<std::mutex> exiv2Lock(gExiv2Mutex);
     try {
       #if USE_EXIV2_UNIQUE_PTR
         Exiv2::Image::UniquePtr image = this->isBuf
@@ -266,6 +297,12 @@ class GetTagsWorker : public Napi::AsyncWorker {
     }
   }
 
+  void OnError(const Napi::Error& e) override {
+    Napi::HandleScope scope(Env());
+    DrainLogEvents(Env());
+    AsyncWorker::OnError(e);
+  }
+
  protected:
   const bool isBuf;
   const Exiv2::byte* buf = nullptr;
@@ -324,6 +361,7 @@ class SetTagsWorker : public Napi::AsyncWorker {
   }
 
   void Execute() override {
+    std::lock_guard<std::mutex> exiv2Lock(gExiv2Mutex);
     try {
       #if USE_EXIV2_UNIQUE_PTR
         Exiv2::Image::UniquePtr image = this->isBuf
@@ -374,6 +412,12 @@ class SetTagsWorker : public Napi::AsyncWorker {
     } else {
       Callback().Call({Env().Null()});
     }
+  }
+
+  void OnError(const Napi::Error& e) override {
+    Napi::HandleScope scope(Env());
+    DrainLogEvents(Env());
+    AsyncWorker::OnError(e);
   }
 
  protected:
@@ -468,6 +512,7 @@ class DeleteTagsWorker : public Napi::AsyncWorker {
   }
 
   void Execute() override {
+    std::lock_guard<std::mutex> exiv2Lock(gExiv2Mutex);
     try {
       #if USE_EXIV2_UNIQUE_PTR
         Exiv2::Image::UniquePtr image = this->isBuf
@@ -530,6 +575,12 @@ class DeleteTagsWorker : public Napi::AsyncWorker {
     } else {
       Callback().Call({Env().Null()});
     }
+  }
+
+  void OnError(const Napi::Error& e) override {
+    Napi::HandleScope scope(Env());
+    DrainLogEvents(Env());
+    AsyncWorker::OnError(e);
   }
 
  protected:
@@ -610,6 +661,7 @@ class GetPreviewsWorker : public Napi::AsyncWorker {
   }
 
   void Execute() override {
+    std::lock_guard<std::mutex> exiv2Lock(gExiv2Mutex);
     try {
       #if USE_EXIV2_UNIQUE_PTR
         Exiv2::Image::UniquePtr image = this->isBuf
@@ -658,6 +710,12 @@ class GetPreviewsWorker : public Napi::AsyncWorker {
       }
       Callback().Call({Env().Null(), array});
     }
+  }
+
+  void OnError(const Napi::Error& e) override {
+    Napi::HandleScope scope(Env());
+    DrainLogEvents(Env());
+    AsyncWorker::OnError(e);
   }
 
  protected:

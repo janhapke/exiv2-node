@@ -1,3 +1,53 @@
+## 0.2808.4 (2026-09-13) - @janhapke/exiv2 fork
+
+* **Fix:** serialize every call into Exiv2 across all four `AsyncWorker`s
+  behind one global mutex, closing a real crash reported against
+  `0.2808.3`: a consumer (photoview's image-decoder process) that fires
+  multiple `getImageTags()` calls concurrently hit a hard native
+  `v8::HandleScope::CreateHandle()` crash shortly after wiring up
+  `setLogHandler()`.
+
+  The crash's own theorized cause (a `Napi::ThreadSafeFunction` ordering
+  race) didn't hold up — that design was already replaced with a
+  mutex-protected plain-data buffer before `0.2808.3` shipped, and never
+  touches N-API from a worker-pool thread. The more likely root cause:
+  Exiv2 itself isn't documented as safe for concurrent access —
+  `<exiv2/xmp_exiv2.hpp>`'s `XmpParser::initialize()` (lazily triggered
+  the first time *any* image carrying XMP data is read) is explicitly
+  documented as "not thread-safe and needs to be called in a thread-safe
+  manner (e.g., on program startup, before threads are created)". This
+  addon never serialized calls across its workers, so two concurrent
+  first-ever XMP reads racing on that lazy init (or any other similarly
+  unsynchronized internal Exiv2 state) has always been possible. Before
+  `0.2808.3`, `Exiv2::LogMsg`'s default handler did a trivial `std::cerr
+  <<` per message; the new handler wiring made that path do real work
+  (mutex lock, heap allocation) on the calling worker thread, plausibly
+  widening the timing window enough to turn a rare pre-existing race into
+  an occasionally-observable one.
+
+  Rather than chase the exact internal Exiv2 state involved, every
+  worker's `Execute()` now holds one global mutex for its entire
+  Exiv2-touching span, so only one call is ever inside Exiv2 at a time,
+  addon-wide. Exiv2 was never validated for concurrent access, so trading
+  away true multi-threaded parallelism here is the right call.
+
+* **Fix:** a `setLogHandler()` callback that throws no longer swallows the
+  triggering call's own result callback. `NAPI_CPP_EXCEPTIONS` (enabled by
+  this addon) turns a throwing JS callback into a C++ exception at the
+  `.Call()` site; left uncaught, it unwound straight out of the calling
+  worker's `OnOK()`, skipping that call's own `getImageTags()`/etc.
+  callback entirely. `DrainLogEvents()` now catches that, prints a notice
+  to `stderr`, and drops any remaining buffered events for that drain
+  instead.
+
+* **Fix:** `DrainLogEvents()` now also runs from every worker's new
+  `OnError()` override, not just `OnOK()`. In practice `OnError()` was
+  (and remains) unreachable in normal operation — every `Execute()`
+  already catches `std::exception`, and `Exiv2::Error` derives from it —
+  but this closes the gap for any future/exotic exception path instead of
+  silently misattributing that call's buffered log events to whichever
+  next call happens to drain the shared buffer.
+
 ## 0.2808.3 (2026-09-13) - @janhapke/exiv2 fork
 
 * **Add:** `setLogLevel()`, `muteLog()`, and `setLogHandler()`, exposing
