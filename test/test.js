@@ -6,6 +6,7 @@ const exiv = require('../exiv2')
   , fs = require('fs')
   , util = require('util')
   , should = require('should')
+  , spawnSync = require('child_process').spawnSync
   , dir = __dirname + '/images';
 
 
@@ -229,6 +230,75 @@ describe('exiv2', function(){
         should.not.exist(previews);
         done();
       });
+    });
+  });
+
+  describe('log control', function() {
+    // Exiv2::LogMsg writes its own diagnostics (malformed TIFF/IFD structure,
+    // etc.) straight to stderr, bypassing getImageTags()'s callback entirely
+    // (see issue #1). corrupt-ifd.jpg is books.jpg with its IFD0 entry count
+    // patched to a bogus 572, which reliably reproduces that: Exiv2 logs
+    // "Directory Image with 572 entries considered invalid; not read." and
+    // getImageTags() still resolves with no tags and no error.
+    //
+    // Every case here runs in a subprocess -- see
+    // test/helpers/log-control-subprocess.js's header comment for why
+    // (Exiv2's default handler bypasses Node's stderr stream wrapper, and
+    // setLogLevel()/setLogHandler() are process-global state that must not
+    // leak between test cases).
+    var corruptFixture = dir + '/corrupt-ifd.jpg';
+    var helper = __dirname + '/helpers/log-control-subprocess.js';
+
+    function run(mode) {
+      return spawnSync(process.execPath, [helper, mode, corruptFixture]);
+    }
+
+    it('logs to stderr by default when Exiv2 hits malformed IFD structure', function() {
+      var result = run('default');
+      result.stderr.toString().should.match(/considered invalid/);
+    });
+
+    it("muteLog() suppresses the diagnostic entirely", function() {
+      var result = run('mute');
+      result.stderr.toString().should.equal('');
+    });
+
+    it("setLogLevel('mute') suppresses the diagnostic entirely", function() {
+      var result = run('mute-via-level');
+      result.stderr.toString().should.equal('');
+    });
+
+    it('setLogHandler(cb) receives {level, message} and stderr stays silent', function() {
+      var result = run('handler');
+      result.stderr.toString().should.equal('');
+
+      var events = JSON.parse(result.stdout.toString());
+      events.should.have.lengthOf(1);
+      events[0].should.have.property('level', 'error');
+      events[0].message.should.match(/considered invalid/);
+    });
+
+    it('setLogHandler(null) restores the default stderr handler', function() {
+      var result = run('handler-then-clear');
+      result.stderr.toString().should.match(/considered invalid/);
+    });
+
+    it('should throw synchronously for an invalid log level', function() {
+      (function(){
+        exiv.setLogLevel('bogus');
+      }).should.throw(/Invalid log level/);
+    });
+
+    it('should throw synchronously if no log level is provided', function() {
+      (function(){
+        exiv.setLogLevel();
+      }).should.throw();
+    });
+
+    it('should throw synchronously for an invalid log handler', function() {
+      (function(){
+        exiv.setLogHandler(123);
+      }).should.throw(/Usage: setLogHandler/);
     });
   });
 

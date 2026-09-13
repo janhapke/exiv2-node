@@ -8,12 +8,14 @@
 #endif
 #include <string>
 #include <map>
+#include <mutex>
 #include <vector>
 #include <cmath>
 #include <exception>
 #include <exiv2/image.hpp>
 #include <exiv2/exif.hpp>
 #include <exiv2/preview.hpp>
+#include <exiv2/error.hpp>
 
 #if EXIV2_MAJOR_VERSION > 0 || (EXIV2_MAJOR_VERSION == 0 && EXIV2_MINOR_VERSION >= 28)
   #define USE_EXIV2_UNIQUE_PTR 1
@@ -26,6 +28,159 @@
 // Create a map of strings for passing them back and forth between the main and
 // worker threads.
 typedef std::map<std::string, std::string> tag_map_t;
+
+// - - - Log control (Exiv2::LogMsg) - - -
+//
+// Exiv2::LogMsg writes its own internal diagnostics (malformed TIFF/IFD
+// structure, etc.) straight to stderr by default, entirely bypassing the JS
+// boundary (see issue #1). LogMsg::setLevel()/setHandler() are the two
+// knobs Exiv2 exposes to control this; both are process-global static state
+// inside libexiv2, not scoped to a single call, so setLogLevel()/
+// setLogHandler() here are process-global too -- a known, documented
+// limitation (see README), not something this addon tries to work around
+// with thread-local tracking.
+//
+// LogMsg::Handler is a plain C function pointer (`void(*)(int, const
+// char*)`), not a std::function, so there's no per-call context slot to
+// stash a JS callback in -- LogTrampoline() below is installed as Exiv2's
+// one process-wide handler. It may run on a libuv worker-pool thread
+// (every Exiv2 call in this addon happens inside some AsyncWorker's
+// Execute()), so it must never touch Napi::* directly -- it only appends
+// plain data to gLogEvents, mutex-protected.
+//
+// A Napi::ThreadSafeFunction was tried first to deliver events directly
+// from LogTrampoline, but Node-API's "blocking" call mode only blocks when
+// the delivery queue is full, not until the JS callback has actually run --
+// so it raced the owning AsyncWorker's own OnOK()/OnError() dispatch (a
+// separate libuv async handle) with no ordering guarantee, observed as the
+// installed handler intermittently not having fired yet by the time the
+// getImageTags()/etc. callback ran. DrainLogEvents() below sidesteps that
+// entirely: it runs synchronously inside each worker's OnOK(), which
+// Node-API guarantees already runs on the main JS thread, so calling the
+// plain (non-threadsafe) Napi::FunctionReference there needs no extra
+// synchronization -- only the plain-data buffer itself does.
+
+namespace {
+
+std::mutex gLogEventsMutex;
+
+struct LogEvent {
+  std::string level;
+  std::string message;
+};
+
+std::vector<LogEvent> gLogEvents;
+
+Napi::FunctionReference gLogHandlerRef;
+bool gLogHandlerInstalled = false;
+
+const char* LevelToString(int level) {
+  switch (level) {
+    case Exiv2::LogMsg::debug: return "debug";
+    case Exiv2::LogMsg::info:  return "info";
+    case Exiv2::LogMsg::warn:  return "warn";
+    case Exiv2::LogMsg::error: return "error";
+    case Exiv2::LogMsg::mute:  return "mute";
+    default: return "warn";
+  }
+}
+
+bool StringToLevel(const std::string& name, Exiv2::LogMsg::Level& level) {
+  if (name == "debug") { level = Exiv2::LogMsg::debug; return true; }
+  if (name == "info")  { level = Exiv2::LogMsg::info;  return true; }
+  if (name == "warn")  { level = Exiv2::LogMsg::warn;  return true; }
+  if (name == "error") { level = Exiv2::LogMsg::error; return true; }
+  if (name == "mute")  { level = Exiv2::LogMsg::mute;  return true; }
+  return false;
+}
+
+// Exiv2::LogMsg::Handler-compatible. May run on a libuv worker-pool thread;
+// only ever touches the mutex-protected plain-data buffer, never Napi::*.
+void LogTrampoline(int level, const char* message) {
+  std::lock_guard<std::mutex> lock(gLogEventsMutex);
+  gLogEvents.push_back(LogEvent{LevelToString(level), message ? message : ""});
+}
+
+}  // namespace
+
+// Delivers any log events buffered (via LogTrampoline) since the last
+// drain to the installed JS handler, in order, then clears the buffer.
+// Must run on the JS thread. Called from every AsyncWorker's OnOK() below,
+// before it invokes its own callback, so a consumer always sees a call's
+// log lines before that call's own result/error callback fires.
+void DrainLogEvents(Napi::Env env) {
+  std::vector<LogEvent> drained;
+  {
+    std::lock_guard<std::mutex> lock(gLogEventsMutex);
+    if (gLogEvents.empty()) {
+      return;
+    }
+    drained.swap(gLogEvents);
+  }
+
+  if (!gLogHandlerInstalled) {
+    return;
+  }
+
+  Napi::HandleScope scope(env);
+  for (const LogEvent& e : drained) {
+    Napi::Object event = Napi::Object::New(env);
+    event.Set("level", Napi::String::New(env, e.level));
+    event.Set("message", Napi::String::New(env, e.message));
+    gLogHandlerRef.Call({event});
+  }
+}
+
+Napi::Value SetLogLevel(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+
+  if (info.Length() < 1 || !info[0].IsString()) {
+    Napi::TypeError::New(env, "Usage: setLogLevel('debug'|'info'|'warn'|'error'|'mute')").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  std::string name = info[0].As<Napi::String>().Utf8Value();
+  Exiv2::LogMsg::Level level;
+  if (!StringToLevel(name, level)) {
+    Napi::TypeError::New(env, "Invalid log level, expected one of: 'debug', 'info', 'warn', 'error', 'mute'").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  Exiv2::LogMsg::setLevel(level);
+  return env.Undefined();
+}
+
+Napi::Value MuteLog(const Napi::CallbackInfo& info) {
+  Exiv2::LogMsg::setLevel(Exiv2::LogMsg::mute);
+  return info.Env().Undefined();
+}
+
+Napi::Value SetLogHandler(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+
+  if (info.Length() < 1 || !(info[0].IsFunction() || info[0].IsNull() || info[0].IsUndefined())) {
+    Napi::TypeError::New(env, "Usage: setLogHandler(function | null)").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  if (info[0].IsFunction()) {
+    gLogHandlerRef = Napi::Persistent(info[0].As<Napi::Function>());
+    gLogHandlerInstalled = true;
+    Exiv2::LogMsg::setHandler(&LogTrampoline);
+  } else {
+    // null/undefined restores Exiv2's own default (stderr) handler. Note
+    // this is *not* the same as muting: LogMsg::setHandler(nullptr) would
+    // suppress messages outright, per error.hpp's own docs. Suppression is
+    // muteLog()/setLogLevel('mute')'s job.
+    gLogHandlerInstalled = false;
+    gLogHandlerRef.Reset();
+    std::lock_guard<std::mutex> lock(gLogEventsMutex);
+    gLogEvents.clear();
+    Exiv2::LogMsg::setHandler(&Exiv2::LogMsg::defaultHandler);
+  }
+
+  return env.Undefined();
+}
 
 // - - - GetTagsWorker - - -
 
@@ -96,6 +251,7 @@ class GetTagsWorker : public Napi::AsyncWorker {
 
   void OnOK() override {
     Napi::HandleScope scope(Env());
+    DrainLogEvents(Env());
 
     if (!exifException.empty()) {
       Callback().Call({Napi::String::New(Env(), exifException), Env().Null()});
@@ -211,6 +367,7 @@ class SetTagsWorker : public Napi::AsyncWorker {
 
   void OnOK() override {
     Napi::HandleScope scope(Env());
+    DrainLogEvents(Env());
 
     if (!exifException.empty()) {
       Callback().Call({Napi::String::New(Env(), exifException)});
@@ -366,6 +523,7 @@ class DeleteTagsWorker : public Napi::AsyncWorker {
 
   void OnOK() override {
     Napi::HandleScope scope(Env());
+    DrainLogEvents(Env());
 
     if (!exifException.empty()) {
       Callback().Call({Napi::String::New(Env(), exifException)});
@@ -484,6 +642,7 @@ class GetPreviewsWorker : public Napi::AsyncWorker {
 
   void OnOK() override {
     Napi::HandleScope scope(Env());
+    DrainLogEvents(Env());
 
     if (!exifException.empty()) {
       Callback().Call({Napi::String::New(Env(), exifException), Env().Null()});
@@ -593,6 +752,17 @@ Napi::Object InitAll(Napi::Env env, Napi::Object exports) {
   exports.Set("setImageTags", Napi::Function::New(env, SetImageTags));
   exports.Set("deleteImageTags", Napi::Function::New(env, DeleteImageTags));
   exports.Set("getImagePreviews", Napi::Function::New(env, GetImagePreviews));
+  exports.Set("setLogLevel", Napi::Function::New(env, SetLogLevel));
+  exports.Set("muteLog", Napi::Function::New(env, MuteLog));
+  exports.Set("setLogHandler", Napi::Function::New(env, SetLogHandler));
+
+  env.AddCleanupHook([]() {
+    gLogHandlerInstalled = false;
+    gLogHandlerRef.Reset();
+    std::lock_guard<std::mutex> lock(gLogEventsMutex);
+    gLogEvents.clear();
+  });
+
   return exports;
 }
 
