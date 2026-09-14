@@ -161,6 +161,19 @@ void DrainLogEvents(Napi::Env env) {
   }
 }
 
+// setLevel()/setHandler() write Exiv2::LogMsg's own static level_/handler_
+// (see error.hpp -- both are plain, non-atomic static members). Every one
+// of Exiv2's internal log macros (EXV_WARNING, etc., used throughout its
+// parsing code) reads both, unconditionally, on every invocation. Without
+// holding gExiv2Mutex here too, calling setLogLevel()/muteLog()/
+// setLogHandler() while any getImageTags()/etc. call is already running
+// races an unsynchronized write on the main thread against those
+// unsynchronized reads on a worker-pool thread -- the same class of bug
+// gExiv2Mutex was introduced to close for concurrent Execute() calls, just
+// on a different pair of call sites. (A consumer that only ever calls
+// these once, at startup before issuing any calls, wouldn't hit this --
+// but nothing in the API contract requires that.)
+
 Napi::Value SetLogLevel(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
 
@@ -176,11 +189,13 @@ Napi::Value SetLogLevel(const Napi::CallbackInfo& info) {
     return env.Undefined();
   }
 
+  std::lock_guard<std::mutex> exiv2Lock(gExiv2Mutex);
   Exiv2::LogMsg::setLevel(level);
   return env.Undefined();
 }
 
 Napi::Value MuteLog(const Napi::CallbackInfo& info) {
+  std::lock_guard<std::mutex> exiv2Lock(gExiv2Mutex);
   Exiv2::LogMsg::setLevel(Exiv2::LogMsg::mute);
   return info.Env().Undefined();
 }
@@ -192,6 +207,8 @@ Napi::Value SetLogHandler(const Napi::CallbackInfo& info) {
     Napi::TypeError::New(env, "Usage: setLogHandler(function | null)").ThrowAsJavaScriptException();
     return env.Undefined();
   }
+
+  std::lock_guard<std::mutex> exiv2Lock(gExiv2Mutex);
 
   if (info[0].IsFunction()) {
     gLogHandlerRef = Napi::Persistent(info[0].As<Napi::Function>());
@@ -815,10 +832,17 @@ Napi::Object InitAll(Napi::Env env, Napi::Object exports) {
   exports.Set("setLogHandler", Napi::Function::New(env, SetLogHandler));
 
   env.AddCleanupHook([]() {
+    std::lock_guard<std::mutex> exiv2Lock(gExiv2Mutex);
     gLogHandlerInstalled = false;
     gLogHandlerRef.Reset();
-    std::lock_guard<std::mutex> lock(gLogEventsMutex);
-    gLogEvents.clear();
+    {
+      std::lock_guard<std::mutex> lock(gLogEventsMutex);
+      gLogEvents.clear();
+    }
+    // Restore Exiv2's own default handler so a dangling pointer into this
+    // addon's code (LogTrampoline) is never left installed in Exiv2's
+    // process-wide static state past this environment's teardown.
+    Exiv2::LogMsg::setHandler(&Exiv2::LogMsg::defaultHandler);
   });
 
   return exports;

@@ -48,6 +48,25 @@
   silently misattributing that call's buffered log events to whichever
   next call happens to drain the shared buffer.
 
+* **Fix:** `setLogLevel()`, `muteLog()`, and `setLogHandler()` now also
+  hold the global Exiv2 mutex above, closing a second instance of the
+  same bug class the mutex was introduced for. `Exiv2::LogMsg::level_`
+  and `handler_` (`error.hpp`) are plain, non-atomic static members, read
+  unconditionally by every one of Exiv2's internal log macros throughout
+  its parsing code; these three functions write them via
+  `LogMsg::setLevel()`/`setHandler()`. Without holding the mutex, calling
+  any of them while a `getImageTags()`/etc. call is already in flight —
+  not just once at quiet startup — raced an unsynchronized write on the
+  main thread against those unsynchronized reads on a worker-pool thread.
+  Found while auditing the logging code for other instances of the crash
+  above.
+
+* **Fix:** the module's `AddCleanupHook` now also restores Exiv2's
+  default log handler (`Exiv2::LogMsg::setHandler(&Exiv2::LogMsg::
+  defaultHandler)`), so a custom handler installed via `setLogHandler()`
+  can't leave a dangling pointer into this addon's own code sitting in
+  Exiv2's process-wide static state past this environment's teardown.
+
 ## 0.2808.3 (2026-09-13) - @janhapke/exiv2 fork
 
 * **Add:** `setLogLevel()`, `muteLog()`, and `setLogHandler()`, exposing
