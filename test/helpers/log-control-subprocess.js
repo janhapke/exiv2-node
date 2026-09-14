@@ -16,6 +16,8 @@
 //   mute-via-level     - setLogLevel('mute') first, prints {err, tagCount} to stdout
 //   handler            - setLogHandler(cb) first, prints the captured events to stdout
 //   handler-then-clear - setLogHandler(cb) then setLogHandler(null), prints {err, tagCount}
+//   throwing-handler   - setLogHandler(cb) whose cb throws, prints {err, tagCount} to
+//                        stdout to prove the call's own callback still fires
 
 var exiv = require('../../exiv2');
 
@@ -41,6 +43,9 @@ if (mode === 'mute') {
 } else if (mode === 'handler-then-clear') {
   exiv.setLogHandler(function() {});
   exiv.setLogHandler(null);
+  exiv.getImageTags(fixture, reportTags);
+} else if (mode === 'throwing-handler') {
+  exiv.setLogHandler(function() { throw new Error('boom from consumer handler'); });
   exiv.getImageTags(fixture, reportTags);
 } else {
   exiv.getImageTags(fixture, reportTags);
