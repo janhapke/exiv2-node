@@ -1,3 +1,93 @@
+## 0.2808.5 (2026-09-14) - @janhapke/exiv2 fork
+
+* **Fix:** `setLogHandler()` no longer crashes the process under real
+  concurrent, multi-`worker_thread` use (issue #6). `0.2808.4`'s
+  `gExiv2Mutex` rework fixed the *originally reported* crash but didn't
+  fix this one — a distinct bug, only reachable via `worker_threads`,
+  reported separately after `0.2808.4` shipped and confirmed still
+  crashing photoview's `DecodeWorkerPool` (which loads this addon into
+  several `worker_thread`s, each calling `setLogHandler()` independently
+  at startup).
+
+  Root cause, confirmed by direct investigation (not just reasoning) after
+  re-reading Node's own docs on addon loading
+  (https://nodejs.org/api/n-api.html#environment-life-cycle-apis,
+  https://nodejs.org/api/addons.html#worker-support): this addon is a
+  Node-API addon (`NODE_API_MODULE`), and Node's own contract for those is
+  that they get their `Init` function called once *per environment* — once
+  for the main thread, and once more for every `worker_thread` that
+  `require()`s them, all in the same process, all sharing the same loaded
+  `.node` file and therefore the same C++ static/global variables. Prior
+  to this fix, the installed JS log handler was stored in one
+  process-global `Napi::FunctionReference` (`gLogHandlerRef`) — but a
+  `Napi::FunctionReference` is inherently tied to the V8 isolate of
+  whichever environment created it. Two `worker_thread`s calling
+  `setLogHandler()` raced to overwrite that single global, and whichever
+  environment's `AsyncWorker` drained a buffered log event *second* ended
+  up invoking a `Napi::FunctionReference` that belonged to a *different*
+  isolate — reproduced locally, byte-for-byte, as the exact
+  `v8::HandleScope::CreateHandle() Cannot create a handle without a
+  HandleScope` fatal error from the issue, by reverting this fix and
+  running 8 concurrent `worker_thread`s each installing their own handler
+  against a malformed-IFD fixture (see
+  `test/helpers/worker-threads-log-isolation.js`).
+
+  Confirmed via the same investigation: `XmpParser::initialize()`/
+  `terminate()` had the identical bug in miniature. `InitAll()` (which
+  Node-API calls once per environment, same as above) called
+  `initialize()` on every environment's setup and `terminate()`
+  unconditionally on every environment's teardown — but `XmpParser`'s
+  `initialized_` flag is Exiv2's own plain, unguarded, **process-wide**
+  static (confirmed by reading `v0.28.8`'s `src/xmp.cpp` directly, not
+  just its header). One `worker_thread` exiting (pool shrink, a crash
+  respawn, app shutdown of just that worker) would call
+  `SXMPMeta::Terminate()` and yank the *entire process's* XMP toolkit out
+  from under every other still-running environment's concurrent Exiv2
+  calls — a second, real, crash-capable bug in the same "process-wide
+  Exiv2 state managed as if it were per-environment" family, caught by
+  auditing the surrounding code for the same bug class rather than fixing
+  only the specifically-reported symptom.
+
+  Fix: both are now correctly scoped.
+    - The installed handler, its "installed" flag, and its pending event
+      buffer now live in a small `InstanceData` struct, one per
+      environment, registered via `env.SetInstanceData()` in `InitAll()`
+      and automatically destroyed by Node-API when that environment tears
+      down — a `Napi::FunctionReference` stored there is only ever read
+      back and `Call()`ed on the same environment that created it, so it
+      can never cross isolates. Since `Exiv2::LogMsg::Handler` is still a
+      plain C function pointer with no per-call context slot,
+      `LogTrampoline` (installed as Exiv2's one process-wide handler,
+      exactly once, at the very first environment's setup) routes each
+      call to the right environment's `InstanceData` via a `thread_local`
+      pointer (`tlsCurrentInstance`) that each `AsyncWorker::Execute()`
+      sets for its own duration — safe because a single OS thread only
+      ever runs one `Execute()` call at a time, even though the *same*
+      pool thread may run `Execute()` calls belonging to different
+      environments at different times. An environment that never called
+      `setLogHandler()` still gets Exiv2's default stderr behavior for its
+      own calls, via `LogTrampoline`'s fallback to
+      `Exiv2::LogMsg::defaultHandler()` — installing a handler in one
+      `worker_thread` no longer silently affects another's diagnostics.
+    - `XmpParser::initialize()`/`terminate()` and installing
+      `LogTrampoline` as Exiv2's global handler now happen exactly once
+      each, guarded by a process-wide environment refcount
+      (`gEnvironmentCount`, under the existing `gExiv2Mutex`): `initialize()`
+      only at the very first environment's setup, `terminate()` only at
+      the very last environment's teardown. No environment's exit can pull
+      Exiv2's XMP toolkit out from under any other still-running
+      environment anymore.
+
+  `setLogLevel()`/`muteLog()` remain process-wide (`Exiv2::LogMsg::level_`
+  has no per-environment concept at all in Exiv2 itself — this is
+  unchanged, pre-existing, documented behavior, not a new limitation), as
+  does the read/write locking behavior from `0.2808.4` (`gExiv2Mutex` is
+  still one lock shared by every environment's `AsyncWorker`s, on purpose
+  — Exiv2's own internal state is genuinely process-wide, not
+  per-environment, so a per-environment lock would not correctly protect
+  it). See the README's new "worker_threads" subsection for the full
+  picture.
+
 ## 0.2808.4 (2026-09-13) - @janhapke/exiv2 fork
 
 * **Fix:** serialize every call into Exiv2 across all four `AsyncWorker`s

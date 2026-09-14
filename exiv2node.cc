@@ -89,19 +89,61 @@ std::shared_mutex gExiv2Mutex;
 // Exiv2::LogMsg writes its own internal diagnostics (malformed TIFF/IFD
 // structure, etc.) straight to stderr by default, entirely bypassing the JS
 // boundary (see issue #1). LogMsg::setLevel()/setHandler() are the two
-// knobs Exiv2 exposes to control this; both are process-global static state
-// inside libexiv2, not scoped to a single call, so setLogLevel()/
-// setLogHandler() here are process-global too -- a known, documented
-// limitation (see README), not something this addon tries to work around
-// with thread-local tracking.
+// knobs Exiv2 exposes to control this; LogMsg::level_ is genuinely
+// process-global static state inside libexiv2 (see gExiv2Mutex's comment),
+// so setLogLevel()/muteLog() are unavoidably process-wide -- a known,
+// documented limitation (see README).
 //
-// LogMsg::Handler is a plain C function pointer (`void(*)(int, const
-// char*)`), not a std::function, so there's no per-call context slot to
-// stash a JS callback in -- LogTrampoline() below is installed as Exiv2's
-// one process-wide handler. It may run on a libuv worker-pool thread
-// (every Exiv2 call in this addon happens inside some AsyncWorker's
-// Execute()), so it must never touch Napi::* directly -- it only appends
-// plain data to gLogEvents, mutex-protected.
+// setLogHandler(), however, is NOT process-wide as of this fix -- see
+// issue #6. This addon is a Node-API addon (NODE_API_MODULE), and per
+// Node's own docs (https://nodejs.org/api/n-api.html#environment-life-cycle-apis,
+// https://nodejs.org/api/addons.html#worker-support) that means its Init
+// function is called once per Node.js *environment* -- once for the main
+// thread, and once more for every worker_thread that require()s it, all in
+// the same process, all sharing the same loaded .node file and therefore
+// the same C++ static/global variables. A previous version of this file
+// stored the installed JS handler (a Napi::FunctionReference, which is
+// inherently tied to the V8 isolate of whichever environment created it)
+// in a single process-global gLogHandlerRef. Two environments calling
+// setLogHandler() raced to overwrite that one global, and whichever
+// environment's AsyncWorker drained a log event second would invoke a
+// Napi::FunctionReference that belonged to a *different* isolate --
+// exactly the "v8::HandleScope::CreateHandle() Cannot create a handle
+// without a HandleScope" fatal crash reported in issue #6, reproduced
+// there by photoview's worker_threads-based DecodeWorkerPool (confirmed:
+// every worker thread in that pool requires this addon and calls
+// setLogHandler() independently).
+//
+// The fix: the installed handler, its "installed" flag, and its pending
+// event buffer now live in InstanceData, fetched via
+// env.GetInstanceData<InstanceData>() -- one instance per environment,
+// automatically created in InitAll() (which Node-API already calls once
+// per environment) and automatically destroyed when that environment
+// tears down. A Napi::FunctionReference stored there is only ever read
+// back and Call()ed on the same environment that created it, so it never
+// crosses isolates.
+//
+// LogMsg::Handler is still a plain C function pointer (`void(*)(int,
+// const char*)`), not a std::function, so there's still no per-call
+// context slot Exiv2 itself gives us to route a warning to the right
+// environment. LogTrampoline() below is installed as Exiv2's one
+// process-wide handler (exactly once, when the first environment loads --
+// see InitAll()) and stays installed until the last environment tears
+// down. It figures out *which* environment's InstanceData a given call
+// belongs to via tlsCurrentInstance, a thread_local pointer each
+// AsyncWorker's Execute() sets for its own duration (see
+// CurrentInstanceGuard below) -- safe because a single OS thread only
+// ever runs one Execute() call at a time (libuv's threadpool contract:
+// a pool thread completes one work item before starting the next), even
+// though the *same* pool thread may run Execute() calls belonging to
+// different environments at different times. LogTrampoline() may run on
+// that libuv worker-pool thread, so -- same as before -- it must never
+// touch Napi::* directly; it only appends plain data to the owning
+// InstanceData's buffer, mutex-protected, or (if no environment's
+// tlsCurrentInstance is set, or that environment never installed a
+// handler) falls back to Exiv2::LogMsg::defaultHandler() so diagnostics
+// are never silently dropped for an environment that didn't ask for
+// custom handling.
 //
 // A Napi::ThreadSafeFunction was tried first to deliver events directly
 // from LogTrampoline, but Node-API's "blocking" call mode only blocks when
@@ -115,19 +157,39 @@ std::shared_mutex gExiv2Mutex;
 // plain (non-threadsafe) Napi::FunctionReference there needs no extra
 // synchronization -- only the plain-data buffer itself does.
 
-namespace {
-
-std::mutex gLogEventsMutex;
-
 struct LogEvent {
   std::string level;
   std::string message;
 };
 
-std::vector<LogEvent> gLogEvents;
+// One per Node.js environment (main thread, or a worker_thread that
+// require()s this addon) -- see the comment above. Owned by that
+// environment via env.SetInstanceData(); Node-API deletes it
+// automatically when the environment tears down.
+struct InstanceData {
+  std::mutex logEventsMutex;
+  std::vector<LogEvent> logEvents;
+  Napi::FunctionReference logHandlerRef;
+  bool logHandlerInstalled = false;
+};
 
-Napi::FunctionReference gLogHandlerRef;
-bool gLogHandlerInstalled = false;
+namespace {
+
+// Set by CurrentInstanceGuard for the duration of each AsyncWorker's
+// Execute() call, so LogTrampoline() (which Exiv2 may invoke synchronously,
+// inline, from deep inside readMetadata()/writeMetadata()) knows which
+// environment's InstanceData a warning belongs to. Thread-local, not just
+// a plain global, because several environments' Execute() calls can be
+// genuinely running concurrently on different libuv worker-pool threads.
+thread_local InstanceData* tlsCurrentInstance = nullptr;
+
+struct CurrentInstanceGuard {
+  InstanceData* previous;
+  explicit CurrentInstanceGuard(InstanceData* instanceData) : previous(tlsCurrentInstance) {
+    tlsCurrentInstance = instanceData;
+  }
+  ~CurrentInstanceGuard() { tlsCurrentInstance = previous; }
+};
 
 const char* LevelToString(int level) {
   switch (level) {
@@ -149,11 +211,27 @@ bool StringToLevel(const std::string& name, Exiv2::LogMsg::Level& level) {
   return false;
 }
 
-// Exiv2::LogMsg::Handler-compatible. May run on a libuv worker-pool thread;
-// only ever touches the mutex-protected plain-data buffer, never Napi::*.
+// Exiv2::LogMsg::Handler-compatible; installed exactly once, process-wide
+// (see InitAll()). May run on a libuv worker-pool thread; only ever
+// touches the mutex-protected plain-data buffer on whichever environment's
+// InstanceData tlsCurrentInstance currently points to, never Napi::*
+// directly.
 void LogTrampoline(int level, const char* message) {
-  std::lock_guard<std::mutex> lock(gLogEventsMutex);
-  gLogEvents.push_back(LogEvent{LevelToString(level), message ? message : ""});
+  InstanceData* instanceData = tlsCurrentInstance;
+  if (instanceData) {
+    std::lock_guard<std::mutex> lock(instanceData->logEventsMutex);
+    if (instanceData->logHandlerInstalled) {
+      instanceData->logEvents.push_back(LogEvent{LevelToString(level), message ? message : ""});
+      return;
+    }
+  }
+  // No environment context (shouldn't normally happen -- every Exiv2 call
+  // in this addon runs inside some AsyncWorker's Execute(), guarded by
+  // CurrentInstanceGuard), or the environment that owns this call never
+  // installed a custom handler: fall back to Exiv2's own default so
+  // diagnostics are never silently dropped just because *some other*
+  // environment elsewhere in the process happens to use setLogHandler().
+  Exiv2::LogMsg::defaultHandler(level, message);
 }
 
 }  // namespace
@@ -165,16 +243,18 @@ void LogTrampoline(int level, const char* message) {
 // always sees a call's log lines before that call's own result/error
 // callback fires.
 void DrainLogEvents(Napi::Env env) {
+  InstanceData* instanceData = env.GetInstanceData<InstanceData>();
+
   std::vector<LogEvent> drained;
   {
-    std::lock_guard<std::mutex> lock(gLogEventsMutex);
-    if (gLogEvents.empty()) {
+    std::lock_guard<std::mutex> lock(instanceData->logEventsMutex);
+    if (instanceData->logEvents.empty()) {
       return;
     }
-    drained.swap(gLogEvents);
+    drained.swap(instanceData->logEvents);
   }
 
-  if (!gLogHandlerInstalled) {
+  if (!instanceData->logHandlerInstalled) {
     return;
   }
 
@@ -184,7 +264,7 @@ void DrainLogEvents(Napi::Env env) {
     event.Set("level", Napi::String::New(env, e.level));
     event.Set("message", Napi::String::New(env, e.message));
     try {
-      gLogHandlerRef.Call({event});
+      instanceData->logHandlerRef.Call({event});
     } catch (const Napi::Error&) {
       // A handler that throws must not take down the call that triggered
       // it (NAPI_CPP_EXCEPTIONS turns a throwing JS callback into a C++
@@ -199,20 +279,27 @@ void DrainLogEvents(Napi::Env env) {
   }
 }
 
-// setLevel()/setHandler() write Exiv2::LogMsg's own static level_/handler_
-// (see error.hpp -- both are plain, non-atomic static members, with no
-// internal protection of any kind, unrelated to the XMP-specific gaps
-// gExiv2Mutex otherwise exists for). Every one of Exiv2's internal log
-// macros (EXV_WARNING, etc., used throughout its parsing code) reads
-// both, unconditionally, on every invocation. So these three take an
-// EXCLUSIVE lock (std::unique_lock), not the shared one GetTagsWorker/
-// GetPreviewsWorker use -- calling setLogLevel()/muteLog()/
-// setLogHandler() while any read is in flight must still block until
-// that read finishes, otherwise it races an unsynchronized write on the
-// main thread against those unsynchronized reads on a worker-pool
-// thread. (A consumer that only ever calls these once, at startup before
-// issuing any calls, wouldn't hit this -- but nothing in the API
-// contract requires that.)
+// setLogLevel()/muteLog() write Exiv2::LogMsg's own static level_ (see
+// error.hpp -- a plain, non-atomic static member, with no internal
+// protection of any kind, unrelated to the XMP-specific gaps gExiv2Mutex
+// otherwise exists for). Every one of Exiv2's internal log macros
+// (EXV_WARNING, etc., used throughout its parsing code) reads it,
+// unconditionally, on every invocation. So these two take an EXCLUSIVE
+// lock (std::unique_lock), not the shared one GetTagsWorker/
+// GetPreviewsWorker use -- calling setLogLevel()/muteLog() while any read
+// is in flight must still block until that read finishes, otherwise it
+// races an unsynchronized write on the main thread against those
+// unsynchronized reads on a worker-pool thread. (A consumer that only
+// ever calls these once, at startup before issuing any calls, wouldn't
+// hit this -- but nothing in the API contract requires that.) Note this
+// is still process-wide, same as before (see the log-control comment
+// above): Exiv2::LogMsg::level_ has no per-environment concept at all.
+//
+// setLogHandler(), by contrast, only ever touches this environment's own
+// InstanceData (see the log-control comment above) -- it doesn't need
+// gExiv2Mutex at all, since Exiv2::LogMsg::handler_ itself is set to
+// LogTrampoline exactly once, process-wide, in InitAll(), and never
+// changed again per-call.
 
 Napi::Value SetLogLevel(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
@@ -248,22 +335,21 @@ Napi::Value SetLogHandler(const Napi::CallbackInfo& info) {
     return env.Undefined();
   }
 
-  std::unique_lock<std::shared_mutex> exiv2Lock(gExiv2Mutex);
+  InstanceData* instanceData = env.GetInstanceData<InstanceData>();
 
   if (info[0].IsFunction()) {
-    gLogHandlerRef = Napi::Persistent(info[0].As<Napi::Function>());
-    gLogHandlerInstalled = true;
-    Exiv2::LogMsg::setHandler(&LogTrampoline);
+    instanceData->logHandlerRef = Napi::Persistent(info[0].As<Napi::Function>());
+    instanceData->logHandlerInstalled = true;
   } else {
-    // null/undefined restores Exiv2's own default (stderr) handler. Note
-    // this is *not* the same as muting: LogMsg::setHandler(nullptr) would
-    // suppress messages outright, per error.hpp's own docs. Suppression is
-    // muteLog()/setLogLevel('mute')'s job.
-    gLogHandlerInstalled = false;
-    gLogHandlerRef.Reset();
-    std::lock_guard<std::mutex> lock(gLogEventsMutex);
-    gLogEvents.clear();
-    Exiv2::LogMsg::setHandler(&Exiv2::LogMsg::defaultHandler);
+    // null/undefined restores Exiv2's own default (stderr) handler for
+    // *this* environment. Note this is not the same as muting:
+    // LogMsg::setHandler(nullptr) would suppress messages outright for
+    // every environment, per error.hpp's own docs -- suppression is
+    // muteLog()/setLogLevel('mute')'s job, and it's still process-wide.
+    instanceData->logHandlerInstalled = false;
+    instanceData->logHandlerRef.Reset();
+    std::lock_guard<std::mutex> lock(instanceData->logEventsMutex);
+    instanceData->logEvents.clear();
   }
 
   return env.Undefined();
@@ -274,10 +360,12 @@ Napi::Value SetLogHandler(const Napi::CallbackInfo& info) {
 class GetTagsWorker : public Napi::AsyncWorker {
  public:
   GetTagsWorker(Napi::Function& callback, const std::string fileName)
-    : Napi::AsyncWorker(callback), isBuf(false), fileName(fileName) {}
+    : Napi::AsyncWorker(callback), isBuf(false), fileName(fileName),
+      instanceData(callback.Env().GetInstanceData<InstanceData>()) {}
 
   GetTagsWorker(Napi::Function& callback, const char* buf, const size_t len)
-    : Napi::AsyncWorker(callback), isBuf(true), bufLen(len) {
+    : Napi::AsyncWorker(callback), isBuf(true), bufLen(len),
+      instanceData(callback.Env().GetInstanceData<InstanceData>()) {
     // Copy the buffer data since it may be garbage collected before Execute runs
     bufCopy = new Exiv2::byte[len];
     memcpy(bufCopy, buf, len);
@@ -295,6 +383,9 @@ class GetTagsWorker : public Napi::AsyncWorker {
     // Read-only (readMetadata() only, never writeMetadata()) -- shared
     // lock, runs concurrently with other reads. See gExiv2Mutex's comment.
     std::shared_lock<std::shared_mutex> exiv2Lock(gExiv2Mutex);
+    // Routes any warning Exiv2 emits during this call to this worker's own
+    // environment -- see the log-control comment and CurrentInstanceGuard.
+    CurrentInstanceGuard logGuard(instanceData);
     try {
       #if USE_EXIV2_UNIQUE_PTR
         Exiv2::Image::UniquePtr image = this->isBuf
@@ -368,6 +459,7 @@ class GetTagsWorker : public Napi::AsyncWorker {
   Exiv2::byte* bufCopy = nullptr;
   const size_t bufLen = 0;
   const std::string fileName = "";
+  InstanceData* instanceData;
   std::string exifException;
   tag_map_t tags;
 };
@@ -403,10 +495,12 @@ Napi::Value GetImageTags(const Napi::CallbackInfo& info) {
 class SetTagsWorker : public Napi::AsyncWorker {
  public:
   SetTagsWorker(Napi::Function& callback, const std::string fileName, tag_map_t tags)
-    : Napi::AsyncWorker(callback), isBuf(false), fileName(fileName), tags(tags) {}
+    : Napi::AsyncWorker(callback), isBuf(false), fileName(fileName), tags(tags),
+      instanceData(callback.Env().GetInstanceData<InstanceData>()) {}
 
   SetTagsWorker(Napi::Function& callback, const char* buf, const size_t len, tag_map_t tags)
-    : Napi::AsyncWorker(callback), isBuf(true), bufLen(len), tags(tags) {
+    : Napi::AsyncWorker(callback), isBuf(true), bufLen(len), tags(tags),
+      instanceData(callback.Env().GetInstanceData<InstanceData>()) {
     // Copy the buffer data since it may be garbage collected before Execute runs
     bufCopy = new Exiv2::byte[len];
     memcpy(bufCopy, buf, len);
@@ -423,6 +517,9 @@ class SetTagsWorker : public Napi::AsyncWorker {
     // Calls writeMetadata() -- exclusive lock. See gExiv2Mutex's comment
     // for why writes can't safely share the lock reads use.
     std::unique_lock<std::shared_mutex> exiv2Lock(gExiv2Mutex);
+    // Routes any warning Exiv2 emits during this call to this worker's own
+    // environment -- see the log-control comment and CurrentInstanceGuard.
+    CurrentInstanceGuard logGuard(instanceData);
     try {
       #if USE_EXIV2_UNIQUE_PTR
         Exiv2::Image::UniquePtr image = this->isBuf
@@ -489,6 +586,7 @@ class SetTagsWorker : public Napi::AsyncWorker {
   const std::string fileName = "";
   std::string exifException;
   tag_map_t tags;
+  InstanceData* instanceData;
 };
 
 Napi::Value SetImageTags(const Napi::CallbackInfo& info) {
@@ -556,10 +654,12 @@ Napi::Value SetImageTags(const Napi::CallbackInfo& info) {
 class DeleteTagsWorker : public Napi::AsyncWorker {
  public:
   DeleteTagsWorker(Napi::Function& callback, const std::string fileName, std::vector<std::string> tags)
-    : Napi::AsyncWorker(callback), isBuf(false), fileName(fileName), tags(tags) {}
+    : Napi::AsyncWorker(callback), isBuf(false), fileName(fileName), tags(tags),
+      instanceData(callback.Env().GetInstanceData<InstanceData>()) {}
 
   DeleteTagsWorker(Napi::Function& callback, const char* buf, const size_t len, std::vector<std::string> tags)
-    : Napi::AsyncWorker(callback), isBuf(true), bufLen(len), tags(tags) {
+    : Napi::AsyncWorker(callback), isBuf(true), bufLen(len), tags(tags),
+      instanceData(callback.Env().GetInstanceData<InstanceData>()) {
     // Copy the buffer data since it may be garbage collected before Execute runs
     bufCopy = new Exiv2::byte[len];
     memcpy(bufCopy, buf, len);
@@ -576,6 +676,9 @@ class DeleteTagsWorker : public Napi::AsyncWorker {
     // Calls writeMetadata() -- exclusive lock, same reasoning as
     // SetTagsWorker::Execute().
     std::unique_lock<std::shared_mutex> exiv2Lock(gExiv2Mutex);
+    // Routes any warning Exiv2 emits during this call to this worker's own
+    // environment -- see the log-control comment and CurrentInstanceGuard.
+    CurrentInstanceGuard logGuard(instanceData);
     try {
       #if USE_EXIV2_UNIQUE_PTR
         Exiv2::Image::UniquePtr image = this->isBuf
@@ -654,6 +757,7 @@ class DeleteTagsWorker : public Napi::AsyncWorker {
   const std::string fileName = "";
   std::string exifException;
   std::vector<std::string> tags;
+  InstanceData* instanceData;
 };
 
 Napi::Value DeleteImageTags(const Napi::CallbackInfo& info) {
@@ -707,10 +811,12 @@ Napi::Value DeleteImageTags(const Napi::CallbackInfo& info) {
 class GetPreviewsWorker : public Napi::AsyncWorker {
  public:
   GetPreviewsWorker(Napi::Function& callback, const std::string fileName)
-    : Napi::AsyncWorker(callback), isBuf(false), fileName(fileName) {}
+    : Napi::AsyncWorker(callback), isBuf(false), fileName(fileName),
+      instanceData(callback.Env().GetInstanceData<InstanceData>()) {}
 
   GetPreviewsWorker(Napi::Function& callback, const char* buf, const size_t len)
-    : Napi::AsyncWorker(callback), isBuf(true), bufLen(len) {
+    : Napi::AsyncWorker(callback), isBuf(true), bufLen(len),
+      instanceData(callback.Env().GetInstanceData<InstanceData>()) {
     // Copy the buffer data since it may be garbage collected before Execute runs
     bufCopy = new Exiv2::byte[len];
     memcpy(bufCopy, buf, len);
@@ -728,6 +834,9 @@ class GetPreviewsWorker : public Napi::AsyncWorker {
     // writeMetadata()) -- shared lock, same reasoning as
     // GetTagsWorker::Execute().
     std::shared_lock<std::shared_mutex> exiv2Lock(gExiv2Mutex);
+    // Routes any warning Exiv2 emits during this call to this worker's own
+    // environment -- see the log-control comment and CurrentInstanceGuard.
+    CurrentInstanceGuard logGuard(instanceData);
     try {
       #if USE_EXIV2_UNIQUE_PTR
         Exiv2::Image::UniquePtr image = this->isBuf
@@ -841,6 +950,7 @@ class GetPreviewsWorker : public Napi::AsyncWorker {
   const std::string fileName = "";
   std::string exifException;
   std::vector<Preview> previews;
+  InstanceData* instanceData;
 };
 
 Napi::Value GetImagePreviews(const Napi::CallbackInfo& info) {
@@ -871,17 +981,48 @@ Napi::Value GetImagePreviews(const Napi::CallbackInfo& info) {
 
 // - - - Module Init - - -
 
+namespace {
+// How many live Node.js environments (main thread + every worker_thread
+// that has require()'d this addon and not yet torn down) currently exist
+// in this process. Guarded by gExiv2Mutex. See the log-control comment
+// above for why this addon -- a Node-API addon -- gets InitAll() called
+// once per environment rather than once per process (issue #6), and why
+// that means XmpParser::initialize()/terminate() and installing
+// LogTrampoline as Exiv2's log handler must happen exactly once each, at
+// the first environment's setup and the last environment's teardown, not
+// once per environment: both are genuinely process-wide Exiv2 state, and
+// tearing them down while another environment is still actively using
+// Exiv2 would pull the toolkit out from under it mid-call.
+int gEnvironmentCount = 0;
+}  // namespace
+
 Napi::Object InitAll(Napi::Env env, Napi::Object exports) {
-  // Runs once, synchronously, while this module is being require()'d --
-  // nothing can possibly be queued on the worker pool yet, so this is
-  // inherently the "thread-safe manner (e.g. on program startup, before
-  // threads are created)" XmpParser::initialize()'s own docs call for. It
-  // closes the one unprotected lazy-init gap in Exiv2's read path (see
-  // gExiv2Mutex's comment): without this, the first Execute() call that
-  // happens to need XMP would trigger this same initialize() call lazily
-  // and unprotected, racing any other worker-pool thread hitting it at
-  // the same time.
-  Exiv2::XmpParser::initialize();
+  env.SetInstanceData(new InstanceData());
+
+  {
+    std::unique_lock<std::shared_mutex> exiv2Lock(gExiv2Mutex);
+    if (gEnvironmentCount == 0) {
+      // First environment in the process to load this addon. Runs
+      // synchronously, before this environment's own worker pool could
+      // possibly have anything queued on it, so this is inherently the
+      // "thread-safe manner (e.g. on program startup, before threads are
+      // created)" XmpParser::initialize()'s own docs call for. It closes
+      // the one unprotected lazy-init gap in Exiv2's read path (see
+      // gExiv2Mutex's comment): without this, the first Execute() call
+      // that happens to need XMP would trigger this same initialize()
+      // call lazily and unprotected, racing any other worker-pool thread
+      // hitting it at the same time. Installing LogTrampoline here too
+      // (rather than per setLogHandler() call, as a previous version of
+      // this file did) means Exiv2::LogMsg::handler_ never needs to
+      // change again for the rest of the process's life -- LogTrampoline
+      // itself routes each call to the right environment, or falls back
+      // to defaultHandler, per InstanceData (see the log-control comment
+      // above).
+      Exiv2::XmpParser::initialize();
+      Exiv2::LogMsg::setHandler(&LogTrampoline);
+    }
+    gEnvironmentCount++;
+  }
 
   exports.Set("getImageTags", Napi::Function::New(env, GetImageTags));
   exports.Set("setImageTags", Napi::Function::New(env, SetImageTags));
@@ -893,18 +1034,17 @@ Napi::Object InitAll(Napi::Env env, Napi::Object exports) {
 
   env.AddCleanupHook([]() {
     std::unique_lock<std::shared_mutex> exiv2Lock(gExiv2Mutex);
-    gLogHandlerInstalled = false;
-    gLogHandlerRef.Reset();
-    {
-      std::lock_guard<std::mutex> lock(gLogEventsMutex);
-      gLogEvents.clear();
+    gEnvironmentCount--;
+    if (gEnvironmentCount == 0) {
+      // Last environment in the process tearing down -- safe to undo the
+      // process-wide setup above, matching counterparts to the calls in
+      // the gEnvironmentCount == 0 branch. (This environment's own
+      // InstanceData -- including any handler it had installed -- is
+      // torn down separately and automatically by Node-API, since it was
+      // registered via env.SetInstanceData() above.)
+      Exiv2::LogMsg::setHandler(&Exiv2::LogMsg::defaultHandler);
+      Exiv2::XmpParser::terminate();
     }
-    // Restore Exiv2's own default handler so a dangling pointer into this
-    // addon's code (LogTrampoline) is never left installed in Exiv2's
-    // process-wide static state past this environment's teardown.
-    Exiv2::LogMsg::setHandler(&Exiv2::LogMsg::defaultHandler);
-    // Matching counterpart to the initialize() call above.
-    Exiv2::XmpParser::terminate();
   });
 
   return exports;

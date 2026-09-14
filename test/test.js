@@ -307,6 +307,50 @@ describe('exiv2', function(){
         exiv.setLogHandler(123);
       }).should.throw(/Usage: setLogHandler/);
     });
+
+    // Regression test for issue #6: this addon is a Node-API addon, so
+    // Node.js loads it fresh into every worker_thread that require()s it
+    // (see exiv2node.cc's log-control comment) -- photoview's
+    // DecodeWorkerPool does exactly this, with each worker thread calling
+    // setLogHandler() independently. Before the per-environment
+    // InstanceData fix, the installed handler was stored in a single
+    // process-global Napi::FunctionReference; two worker threads racing to
+    // set it, followed by a third thread's DrainLogEvents() invoking
+    // whichever one won across a V8 isolate boundary, crashed the process
+    // with a native "v8::HandleScope::CreateHandle() Cannot create a
+    // handle without a HandleScope" fatal error. Confirmed by reverting
+    // the fix locally and running this exact scenario, which reliably
+    // reproduced that crash (non-zero/signal exit, no JSON on stdout).
+    it('setLogHandler() is isolated per worker_thread and does not crash under concurrent use', function() {
+      var helper = __dirname + '/helpers/worker-threads-log-isolation.js';
+      var workerCount = 6;
+      var iterations = 150;
+      var result = spawnSync(process.execPath, [helper, corruptFixture, String(workerCount), String(iterations)], {
+        timeout: 30000,
+      });
+
+      // A native fatal error kills the process with a signal (or a
+      // non-zero, non-JS exit code) before it ever writes its JSON report.
+      should.not.exist(result.signal);
+      result.status.should.equal(0);
+
+      var report = JSON.parse(result.stdout.toString());
+      report.perWorkerEventCounts.should.have.lengthOf(workerCount);
+
+      // Worker 0 never installed a handler; workers 1..N-1 each installed
+      // their own and should each have received every warning from their
+      // own `iterations` calls, via their own handler, with no crash and
+      // no cross-worker interference.
+      report.perWorkerEventCounts[0].should.equal(0);
+      for (var i = 1; i < workerCount; i++) {
+        report.perWorkerEventCounts[i].should.equal(iterations);
+      }
+
+      // Worker 0's warnings must still reach stderr via Exiv2's default
+      // handler -- proving other workers' setLogHandler() calls don't
+      // silently swallow diagnostics for a worker that never opted in.
+      result.stderr.toString().should.match(/considered invalid/);
+    });
   });
 
   describe('.getDate()', function() {
