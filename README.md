@@ -180,13 +180,18 @@ Two functions let you control this:
 `'mute'` (Exiv2's default level is `'warn'`); only messages at or above
 that severity reach the handler.
 
-**Caveat:** both of these control Exiv2's own process-global state, not
-anything scoped to a single call — they affect every `getImageTags()`/
-`setImageTags()`/`deleteImageTags()`/`getImagePreviews()` call in the
-process. A handler installed via `setLogHandler()` receives log events
-from whichever call happens to be running at the time; if multiple calls
-are in flight concurrently, there is no way to attribute a given message
-back to a specific one.
+**Caveat:** `setLogLevel()`/`muteLog()` control Exiv2's own process-global
+log *level*, not anything scoped to a single call — they affect every
+`getImageTags()`/`setImageTags()`/`deleteImageTags()`/`getImagePreviews()`
+call in the process, including ones made from other Node.js environments
+(see "Concurrency and worker_threads" below). `setLogHandler()`, by
+contrast, is scoped to the Node.js environment (main thread, or a single
+`worker_thread`) that calls it — a handler installed on the main thread
+never receives events from calls made in a worker thread, and vice versa.
+Within one environment, a handler receives log events from whichever call
+on that environment happens to be running at the time; if multiple calls
+from the same environment are in flight concurrently, there is no way to
+attribute a given message back to a specific one.
 
 ## Concurrency
 
@@ -220,6 +225,25 @@ internally mutex-protects the write itself) but can produce a wrong XMP
 tag value, or occasionally a normal `err` on the affected call — not a
 crash. If your files don't carry unusual/custom XMP namespaces this is
 very unlikely to matter in practice.
+
+### `worker_threads`
+
+This addon is a [Node-API](https://nodejs.org/api/n-api.html) addon, which
+Node.js loads fresh into **every** environment that `require()`s it — the
+main thread, and independently, any `worker_thread` — all sharing the same
+underlying Exiv2 library and its process-wide state (`XmpParser`, the log
+level, etc.), but each with its own isolated `setLogHandler()` handler (see
+above). This means it's safe to `require()` this addon and call
+`setLogHandler()` from inside a `worker_thread` pool (e.g. to parallelize
+decoding across CPU cores) without one worker's handler ever being invoked
+across another worker's V8 isolate — a real crash
+([`v8::HandleScope::CreateHandle() Cannot create a handle without a
+HandleScope`](https://github.com/janhapke/exiv2-node/issues/6)) prior to
+this being fixed. `getImageTags()`/`setImageTags()`/`deleteImageTags()`/
+`getImagePreviews()` calls from different `worker_thread`s are subject to
+the same read/write locking described above, shared across all threads in
+the process (not per-worker) — so, for example, a write from one worker
+still blocks a concurrent read from another.
 
 ## Sample Usage
 
