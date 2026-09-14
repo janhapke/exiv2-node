@@ -25,11 +25,9 @@
   widening the timing window enough to turn a rare pre-existing race into
   an occasionally-observable one.
 
-  Rather than chase the exact internal Exiv2 state involved, every
-  worker's `Execute()` now holds one global mutex for its entire
-  Exiv2-touching span, so only one call is ever inside Exiv2 at a time,
-  addon-wide. Exiv2 was never validated for concurrent access, so trading
-  away true multi-threaded parallelism here is the right call.
+  Every worker's `Execute()` now holds a global lock for its entire
+  Exiv2-touching span (see the next entry for why this became a
+  `std::shared_mutex` rather than staying a plain exclusive `std::mutex`).
 
 * **Fix:** a `setLogHandler()` callback that throws no longer swallows the
   triggering call's own result callback. `NAPI_CPP_EXCEPTIONS` (enabled by
@@ -66,6 +64,51 @@
   defaultHandler)`), so a custom handler installed via `setLogHandler()`
   can't leave a dangling pointer into this addon's own code sitting in
   Exiv2's process-wide static state past this environment's teardown.
+
+* **Change:** restored real parallelism for `getImageTags()`/
+  `getImagePreviews()` (measured ~4x throughput on 40 concurrent reads
+  with the default `UV_THREADPOOL_SIZE=4`, vs. full serialization),
+  without reopening the crash the fixes above closed. The global lock is
+  now a `std::shared_mutex`: read-only calls (`getImageTags()`,
+  `getImagePreviews()` — `readMetadata()` only, never `writeMetadata()`)
+  take a shared lock and run concurrently with each other again; writes
+  (`setImageTags()`, `deleteImageTags()`) and the three log-control
+  functions keep an exclusive lock, unchanged from before.
+
+  This split follows [Exiv2's own documented thread-safety
+  model](https://dev.exiv2.org/projects/exiv2/wiki/Thread_safety),
+  cross-checked against Exiv2 0.28.8's actual source rather than trusting
+  the docs summary alone:
+  - Exif/IPTC parsing is reentrant, and the Adobe XMP toolkit's own
+    `encode()`/`decode()` are documented thread-safe (internal mutexes),
+    provided `XmpParser::initialize()` has already run — which is
+    documented as itself not thread-safe on first (lazy) use. `InitAll()`
+    now calls it once, explicitly, at module load — inherently
+    single-threaded, before any `Execute()` can possibly run — closing
+    that gap for the read path.
+  - `XmpProperties::registerNs()` (called internally by `decode()`, i.e.
+    on every read that hits XMP) turned out to already be
+    mutex-protected against memory corruption in `0.28.8`'s
+    `src/properties.cpp` — confirmed by reading the actual source, not
+    just Exiv2's wiki (whose "not thread-safe" wording predates that
+    protection: traced via `git log`/discussion history to a 2019
+    locking commit, years before a 2022 bug report describing the
+    *logical* version of this problem — two threads' conflicting
+    namespace registrations overwriting each other in the one shared
+    registry, not memory corruption). That residual logical risk is
+    documented in the README rather than engineered around, since Exiv2
+    has no public, narrower hook to fix it from outside.
+  - `XmpParser::encode()` (the path `writeMetadata()` takes whenever a
+    file already carries XMP data) is a different story: it iterates
+    `XmpProperties::nsRegistry_` directly, with no lock at all, while
+    `registerNs()` mutates that same map under its own mutex elsewhere —
+    genuine, memory-unsafe iterator invalidation if it races another
+    XMP-touching call. Confirmed still present in the newest Exiv2
+    release available as of this writing (`0.28.9`) — Exiv2 merged a
+    real fix for this (`XmpParser`'s `thread_local` registry, a
+    lifecycle mutex, `Exiv2/exiv2#3448`) to `main` on 2026-02-11, but it
+    hasn't been backported to any released `0.28.x` yet. Writes stay
+    fully exclusive until that ships in a release this addon can pick up.
 
 ## 0.2808.3 (2026-09-13) - @janhapke/exiv2 fork
 

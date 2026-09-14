@@ -190,16 +190,36 @@ back to a specific one.
 
 ## Concurrency
 
-`getImageTags()`, `setImageTags()`, `deleteImageTags()`, and
-`getImagePreviews()` all run off the main thread and are safe to call
-concurrently from JS — but internally, only one of them actually runs
-inside Exiv2 at a time; concurrent calls queue up and are serviced one
-after another. This is deliberate: Exiv2 itself isn't documented as safe
-for genuinely concurrent access (e.g. `Exiv2::XmpParser::initialize()`,
-lazily triggered the first time any image with XMP data is read, is
-explicitly documented as not thread-safe), so this addon trades away true
-multi-threaded parallelism for correctness rather than risk a native
-crash under concurrent use.
+All four calls run off the main thread and are safe to call concurrently
+from JS. Internally:
+
+- `getImageTags()` and `getImagePreviews()` (read-only — `readMetadata()`
+  only) run **truly in parallel** with each other, up to Node's worker
+  pool size (`UV_THREADPOOL_SIZE`, 4 by default).
+- `setImageTags()` and `deleteImageTags()` (call `writeMetadata()`) are
+  **serialized** — only one write, and no concurrent read, runs at a
+  time.
+- `setLogLevel()`/`muteLog()`/`setLogHandler()` are also serialized
+  against everything else, briefly, while they run.
+
+This split follows [Exiv2's own documented thread-safety
+model](https://dev.exiv2.org/projects/exiv2/wiki/Thread_safety): Exif/IPTC
+parsing is reentrant, and the XMP toolkit's own `encode()`/`decode()` are
+documented thread-safe internally — provided `XmpParser::initialize()` has
+already run once, which this addon does automatically at load time, before
+any concurrent call is possible. Writes stay serialized because
+`XmpParser::encode()` (the path `writeMetadata()` takes whenever a file
+already carries XMP data) iterates an internal Exiv2 registry with no lock
+at all as of Exiv2 0.28.x — a real, upstream, not-yet-released-fixed race,
+not something this addon can safely work around from the outside.
+
+**Known residual risk on reads:** two concurrent reads that register
+conflicting XMP namespace prefixes can still overwrite each other's entry
+in Exiv2's one shared internal registry. This is memory-safe (Exiv2
+internally mutex-protects the write itself) but can produce a wrong XMP
+tag value, or occasionally a normal `err` on the affected call — not a
+crash. If your files don't carry unusual/custom XMP namespaces this is
+very unlikely to matter in practice.
 
 ## Sample Usage
 

@@ -9,6 +9,7 @@
 #include <string>
 #include <map>
 #include <mutex>
+#include <shared_mutex>
 #include <vector>
 #include <cmath>
 #include <exception>
@@ -16,6 +17,7 @@
 #include <exiv2/exif.hpp>
 #include <exiv2/preview.hpp>
 #include <exiv2/error.hpp>
+#include <exiv2/xmp_exiv2.hpp>
 
 #if EXIV2_MAJOR_VERSION > 0 || (EXIV2_MAJOR_VERSION == 0 && EXIV2_MINOR_VERSION >= 28)
   #define USE_EXIV2_UNIQUE_PTR 1
@@ -29,22 +31,58 @@
 // worker threads.
 typedef std::map<std::string, std::string> tag_map_t;
 
-// Serializes every call into Exiv2 across all four AsyncWorkers below. Each
+// Guards every call into Exiv2 across all four AsyncWorkers below. Each
 // worker's Execute() runs on a libuv worker-pool thread, so without this,
-// two workers' Execute() calls can run genuinely concurrently -- and Exiv2
-// itself is not documented as safe for that: e.g.
-// <exiv2/xmp_exiv2.hpp>'s XmpParser::initialize() (lazily triggered the
-// first time any image carrying XMP data is read) is explicitly documented
-// as "not thread-safe and needs to be called in a thread-safe manner (e.g.,
-// on program startup, before threads are created)". Two concurrent
-// first-ever XMP reads racing on that lazy init (or any other similarly
-// unsynchronized internal Exiv2 state -- XmpParser is just the one
-// instance that happens to be documented) is a plausible cause of hard,
-// unpredictable native crashes in a consumer that fires multiple calls
-// concurrently. Trading away true parallelism here is the
-// right call: Exiv2 was never validated for concurrent access, so letting
-// two calls race inside it isn't a real performance feature to give up.
-std::mutex gExiv2Mutex;
+// two workers' Execute() calls can run genuinely concurrently.
+//
+// This is a std::shared_mutex, not a plain mutex, because Exiv2's own
+// documented thread-safety model (https://dev.exiv2.org/projects/exiv2/
+// wiki/Thread_safety, cross-checked against Exiv2 0.28.8's actual source)
+// splits cleanly along read/write lines once two specific gaps are closed
+// by us:
+//
+//   - Exif and IPTC parsing is reentrant, and the Adobe XMP toolkit's own
+//     encode()/decode() are documented thread-safe (internal mutexes),
+//     PROVIDED XmpParser::initialize() has already run. initialize()
+//     itself is documented as "not thread-safe... call it in a
+//     thread-safe manner (e.g. on program startup, before threads are
+//     created)" -- InitAll() below does exactly that, once, before any
+//     Execute() can possibly run, closing that gap for good.
+//   - XmpProperties::registerNs() (called internally by decode(), i.e.
+//     by every getImageTags()/getImagePreviews() read that hits XMP) IS
+//     internally mutex-protected against memory corruption in 0.28.8 --
+//     confirmed by reading src/properties.cpp, not just the docs. Its
+//     residual risk under concurrent reads is *logical*, not
+//     memory-unsafe: two threads registering conflicting namespace
+//     prefixes can still stomp on each other's entry in the one shared
+//     global registry, which can surface as a wrong tag value or a
+//     caught Exiv2::Error (turned into a normal `err` by this addon's
+//     existing try/catch) -- not a crash. Documented, accepted residual
+//     risk; see the README.
+//   - XmpParser::encode() (the path setImageTags()/deleteImageTags() take
+//     via writeMetadata(), whenever the file already carries XMP data)
+//     is a different story: it directly iterates
+//     XmpProperties::nsRegistry_ with NO lock at all, while registerNs()
+//     mutates that same map under its own mutex elsewhere -- genuine,
+//     memory-unsafe iterator invalidation if it races another XMP-
+//     touching call. Not something we can narrow a lock around from
+//     outside Exiv2 (it's buried inside encode()'s internals), so writes
+//     stay fully exclusive below.
+//
+// So: GetTagsWorker and GetPreviewsWorker (read-only -- readMetadata()
+// only, never writeMetadata()) take a shared lock and run concurrently
+// with each other again. SetTagsWorker and DeleteTagsWorker
+// (writeMetadata()) keep taking an exclusive lock, same as
+// SetLogLevel()/MuteLog()/SetLogHandler() (Exiv2::LogMsg::level_/
+// handler_, error.hpp, are plain non-atomic statics with no internal
+// protection at all -- entirely on us, unrelated to XMP).
+//
+// This isn't a claim that every other corner of Exiv2 (TIFF/RAW/ICC/
+// MakerNote parsing, etc.) has been audited for similar issues -- only
+// properties.cpp and xmp.cpp were. It's a deliberate, evidence-based
+// tradeoff given how much of Exiv2's own documented exceptions this
+// closes, not a guarantee.
+std::shared_mutex gExiv2Mutex;
 
 // - - - Log control (Exiv2::LogMsg) - - -
 //
@@ -162,17 +200,19 @@ void DrainLogEvents(Napi::Env env) {
 }
 
 // setLevel()/setHandler() write Exiv2::LogMsg's own static level_/handler_
-// (see error.hpp -- both are plain, non-atomic static members). Every one
-// of Exiv2's internal log macros (EXV_WARNING, etc., used throughout its
-// parsing code) reads both, unconditionally, on every invocation. Without
-// holding gExiv2Mutex here too, calling setLogLevel()/muteLog()/
-// setLogHandler() while any getImageTags()/etc. call is already running
-// races an unsynchronized write on the main thread against those
-// unsynchronized reads on a worker-pool thread -- the same class of bug
-// gExiv2Mutex was introduced to close for concurrent Execute() calls, just
-// on a different pair of call sites. (A consumer that only ever calls
-// these once, at startup before issuing any calls, wouldn't hit this --
-// but nothing in the API contract requires that.)
+// (see error.hpp -- both are plain, non-atomic static members, with no
+// internal protection of any kind, unrelated to the XMP-specific gaps
+// gExiv2Mutex otherwise exists for). Every one of Exiv2's internal log
+// macros (EXV_WARNING, etc., used throughout its parsing code) reads
+// both, unconditionally, on every invocation. So these three take an
+// EXCLUSIVE lock (std::unique_lock), not the shared one GetTagsWorker/
+// GetPreviewsWorker use -- calling setLogLevel()/muteLog()/
+// setLogHandler() while any read is in flight must still block until
+// that read finishes, otherwise it races an unsynchronized write on the
+// main thread against those unsynchronized reads on a worker-pool
+// thread. (A consumer that only ever calls these once, at startup before
+// issuing any calls, wouldn't hit this -- but nothing in the API
+// contract requires that.)
 
 Napi::Value SetLogLevel(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
@@ -189,13 +229,13 @@ Napi::Value SetLogLevel(const Napi::CallbackInfo& info) {
     return env.Undefined();
   }
 
-  std::lock_guard<std::mutex> exiv2Lock(gExiv2Mutex);
+  std::unique_lock<std::shared_mutex> exiv2Lock(gExiv2Mutex);
   Exiv2::LogMsg::setLevel(level);
   return env.Undefined();
 }
 
 Napi::Value MuteLog(const Napi::CallbackInfo& info) {
-  std::lock_guard<std::mutex> exiv2Lock(gExiv2Mutex);
+  std::unique_lock<std::shared_mutex> exiv2Lock(gExiv2Mutex);
   Exiv2::LogMsg::setLevel(Exiv2::LogMsg::mute);
   return info.Env().Undefined();
 }
@@ -208,7 +248,7 @@ Napi::Value SetLogHandler(const Napi::CallbackInfo& info) {
     return env.Undefined();
   }
 
-  std::lock_guard<std::mutex> exiv2Lock(gExiv2Mutex);
+  std::unique_lock<std::shared_mutex> exiv2Lock(gExiv2Mutex);
 
   if (info[0].IsFunction()) {
     gLogHandlerRef = Napi::Persistent(info[0].As<Napi::Function>());
@@ -252,7 +292,9 @@ class GetTagsWorker : public Napi::AsyncWorker {
 
   // Executed inside the worker-thread. Not safe to access Napi values here.
   void Execute() override {
-    std::lock_guard<std::mutex> exiv2Lock(gExiv2Mutex);
+    // Read-only (readMetadata() only, never writeMetadata()) -- shared
+    // lock, runs concurrently with other reads. See gExiv2Mutex's comment.
+    std::shared_lock<std::shared_mutex> exiv2Lock(gExiv2Mutex);
     try {
       #if USE_EXIV2_UNIQUE_PTR
         Exiv2::Image::UniquePtr image = this->isBuf
@@ -378,7 +420,9 @@ class SetTagsWorker : public Napi::AsyncWorker {
   }
 
   void Execute() override {
-    std::lock_guard<std::mutex> exiv2Lock(gExiv2Mutex);
+    // Calls writeMetadata() -- exclusive lock. See gExiv2Mutex's comment
+    // for why writes can't safely share the lock reads use.
+    std::unique_lock<std::shared_mutex> exiv2Lock(gExiv2Mutex);
     try {
       #if USE_EXIV2_UNIQUE_PTR
         Exiv2::Image::UniquePtr image = this->isBuf
@@ -529,7 +573,9 @@ class DeleteTagsWorker : public Napi::AsyncWorker {
   }
 
   void Execute() override {
-    std::lock_guard<std::mutex> exiv2Lock(gExiv2Mutex);
+    // Calls writeMetadata() -- exclusive lock, same reasoning as
+    // SetTagsWorker::Execute().
+    std::unique_lock<std::shared_mutex> exiv2Lock(gExiv2Mutex);
     try {
       #if USE_EXIV2_UNIQUE_PTR
         Exiv2::Image::UniquePtr image = this->isBuf
@@ -678,7 +724,10 @@ class GetPreviewsWorker : public Napi::AsyncWorker {
   }
 
   void Execute() override {
-    std::lock_guard<std::mutex> exiv2Lock(gExiv2Mutex);
+    // Read-only (readMetadata() + preview extraction, never
+    // writeMetadata()) -- shared lock, same reasoning as
+    // GetTagsWorker::Execute().
+    std::shared_lock<std::shared_mutex> exiv2Lock(gExiv2Mutex);
     try {
       #if USE_EXIV2_UNIQUE_PTR
         Exiv2::Image::UniquePtr image = this->isBuf
@@ -823,6 +872,17 @@ Napi::Value GetImagePreviews(const Napi::CallbackInfo& info) {
 // - - - Module Init - - -
 
 Napi::Object InitAll(Napi::Env env, Napi::Object exports) {
+  // Runs once, synchronously, while this module is being require()'d --
+  // nothing can possibly be queued on the worker pool yet, so this is
+  // inherently the "thread-safe manner (e.g. on program startup, before
+  // threads are created)" XmpParser::initialize()'s own docs call for. It
+  // closes the one unprotected lazy-init gap in Exiv2's read path (see
+  // gExiv2Mutex's comment): without this, the first Execute() call that
+  // happens to need XMP would trigger this same initialize() call lazily
+  // and unprotected, racing any other worker-pool thread hitting it at
+  // the same time.
+  Exiv2::XmpParser::initialize();
+
   exports.Set("getImageTags", Napi::Function::New(env, GetImageTags));
   exports.Set("setImageTags", Napi::Function::New(env, SetImageTags));
   exports.Set("deleteImageTags", Napi::Function::New(env, DeleteImageTags));
@@ -832,7 +892,7 @@ Napi::Object InitAll(Napi::Env env, Napi::Object exports) {
   exports.Set("setLogHandler", Napi::Function::New(env, SetLogHandler));
 
   env.AddCleanupHook([]() {
-    std::lock_guard<std::mutex> exiv2Lock(gExiv2Mutex);
+    std::unique_lock<std::shared_mutex> exiv2Lock(gExiv2Mutex);
     gLogHandlerInstalled = false;
     gLogHandlerRef.Reset();
     {
@@ -843,6 +903,8 @@ Napi::Object InitAll(Napi::Env env, Napi::Object exports) {
     // addon's code (LogTrampoline) is never left installed in Exiv2's
     // process-wide static state past this environment's teardown.
     Exiv2::LogMsg::setHandler(&Exiv2::LogMsg::defaultHandler);
+    // Matching counterpart to the initialize() call above.
+    Exiv2::XmpParser::terminate();
   });
 
   return exports;
